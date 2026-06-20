@@ -98,15 +98,15 @@ app.get('/api/admin/eleves', async (req, res) => {
 
 // CREATE a new Eleve and his Inscription
 app.post('/api/admin/eleves', async (req, res) => {
-  const { nom, prenom, date_naissance, adresse, parent_nom, parent_telephone, parent_email, filiation, infos_importantes, classeId, annee_scolaire } = req.body;
+  const { nom, prenom, date_naissance, adresse, parent_nom, parent_telephone, parent_email, filiation, infos_importantes, classeId, annee_scolaire, matricule, photoUrl } = req.body;
   try {
-    // Generate a unique matricule
+    // Generate a unique matricule if not provided
     const count = await prisma.eleve.count();
-    const matricule = `GSP-${String(count + 1).padStart(4, '0')}`;
+    const finalMatricule = matricule ? matricule : `GSP-${String(count + 1).padStart(4, '0')}`;
 
     const eleve = await prisma.$transaction(async (tx) => {
       const newEleve = await tx.eleve.create({
-        data: { matricule, nom, prenom, date_naissance: date_naissance ? new Date(date_naissance) : null, adresse, parent_nom, parent_telephone, parent_email, filiation, infos_importantes }
+        data: { matricule: finalMatricule, nom, prenom, date_naissance: date_naissance ? new Date(date_naissance) : null, adresse, parent_nom, parent_telephone, parent_email, filiation, infos_importantes, photoUrl }
       });
       await tx.inscription.create({
         data: {
@@ -128,7 +128,7 @@ app.post('/api/admin/eleves', async (req, res) => {
 
 // UPDATE an Eleve
 app.put('/api/admin/eleves/:id', async (req, res) => {
-  const { prenom, nom, date_naissance, adresse, parent_nom, filiation, parent_telephone, parent_email, infos_importantes } = req.body;
+  const { prenom, nom, date_naissance, adresse, parent_nom, filiation, parent_telephone, parent_email, infos_importantes, photoUrl } = req.body;
   const eleveId = parseInt(req.params.id);
   try {
     const eleve = await prisma.eleve.update({
@@ -136,7 +136,7 @@ app.put('/api/admin/eleves/:id', async (req, res) => {
       data: {
         prenom, nom, 
         date_naissance: date_naissance ? new Date(date_naissance) : null,
-        adresse, parent_nom, filiation, parent_telephone, parent_email, infos_importantes
+        adresse, parent_nom, filiation, parent_telephone, parent_email, infos_importantes, photoUrl
       }
     });
     res.json({ message: 'Élève mis à jour avec succès', eleve });
@@ -513,13 +513,20 @@ app.get('/api/admin/classes/:classeId/matieres/:matiereId/notes', async (req, re
       orderBy: { eleve: { nom: 'asc' } }
     });
 
-    const result = inscriptions.map(ins => ({
-      eleveId: ins.eleve.id,
-      nom: ins.eleve.nom,
-      prenom: ins.eleve.prenom,
-      matricule: ins.eleve.matricule,
-      notes: ins.eleve.notes
-    }));
+    const result = [];
+    const seen = new Set();
+    for (const ins of inscriptions) {
+      if (!seen.has(ins.eleve.id)) {
+        seen.add(ins.eleve.id);
+        result.push({
+          eleveId: ins.eleve.id,
+          nom: ins.eleve.nom,
+          prenom: ins.eleve.prenom,
+          matricule: ins.eleve.matricule,
+          notes: ins.eleve.notes
+        });
+      }
+    }
 
     res.json(result);
   } catch (e) {
@@ -806,11 +813,26 @@ app.get('/api/teacher/matieres/:id/eleves', async (req, res) => {
         statut: 'Validé' // Only fetch validated students
       },
       include: {
-        eleve: true
+        eleve: {
+          include: {
+            notes: {
+              where: { matiereId: matiereId }
+            }
+          }
+        }
       }
     });
 
-    res.json({ eleves: inscriptions.map(i => i.eleve) });
+    const result = [];
+    const seen = new Set();
+    for (const ins of inscriptions) {
+      if (!seen.has(ins.eleve.id)) {
+        seen.add(ins.eleve.id);
+        result.push(ins.eleve);
+      }
+    }
+
+    res.json({ eleves: result });
   } catch (error) {
     res.status(500).json({ error: 'Erreur interne.' });
   }

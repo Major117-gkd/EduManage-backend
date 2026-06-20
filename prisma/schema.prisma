@@ -29,6 +29,7 @@ model Eleve {
   matricule       String        @unique
   nom             String
   prenom          String
+  photoUrl        String?       @db.Text
   date_naissance  DateTime?
   adresse         String?
   parent_nom      String?
