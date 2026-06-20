@@ -4,6 +4,13 @@ const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { PrismaClient } = require('@prisma/client');
+const {
+  computeSubjectAverageFromNotes,
+  computeGeneralAverage,
+  buildMatiereResult,
+  assignRanks,
+  assignRanksByGroup,
+} = require('./gradeUtils');
 
 const prisma = new PrismaClient();
 const app = express();
@@ -70,7 +77,13 @@ app.post('/api/login', async (req, res) => {
 // LIST all Professeurs
 app.get('/api/admin/professeurs', async (req, res) => {
   try {
-    const profs = await prisma.professeur.findMany({ orderBy: { nom: 'asc' }, include: { matieres: { include: { classe: true } } } });
+    const profs = await prisma.professeur.findMany({
+      orderBy: { nom: 'asc' },
+      include: {
+        utilisateur: { select: { id: true, email: true, nom: true, role: true, createdAt: true } },
+        matieres: { include: { classe: true } },
+      },
+    });
     res.json(profs);
   } catch (error) {
     res.status(500).json({ error: 'Erreur interne.' });
@@ -492,19 +505,24 @@ app.delete('/api/admin/matieres/:id', async (req, res) => {
 app.get('/api/admin/classes/:classeId/matieres/:matiereId/notes', async (req, res) => {
   const classeId = parseInt(req.params.classeId);
   const matiereId = parseInt(req.params.matiereId);
-  const { periode } = req.query;
+  const { periode, annee_scolaire } = req.query;
 
   try {
     // Get all validated students in this class
     const inscriptions = await prisma.inscription.findMany({
-      where: { classeId, statut: 'Validé' },
+      where: {
+        classeId,
+        statut: 'Validé',
+        ...(annee_scolaire ? { annee_scolaire } : {})
+      },
       include: {
         eleve: {
           include: {
             notes: {
               where: {
                 matiereId,
-                ...(periode ? { periode } : {})
+                ...(periode ? { periode } : {}),
+                ...(annee_scolaire ? { annee_scolaire } : {})
               }
             }
           }
@@ -581,6 +599,84 @@ app.delete('/api/admin/notes/:id', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════
+//  CONSULTATION (Read-only grades overview)
+// ═══════════════════════════════════════════════
+
+app.get('/api/admin/notes/consultation', async (req, res) => {
+  const { annee_scolaire, periode, classeId, niveau } = req.query;
+
+  try {
+    const inscriptions = await prisma.inscription.findMany({
+      where: {
+        statut: 'Validé',
+        ...(annee_scolaire ? { annee_scolaire } : {}),
+        ...(classeId ? { classeId: parseInt(classeId) } : {}),
+        ...(niveau ? { classe: { niveau } } : {}),
+      },
+      include: {
+        eleve: {
+          include: {
+            notes: {
+              where: {
+                ...(periode ? { periode } : {}),
+                ...(annee_scolaire ? { annee_scolaire } : {}),
+              },
+            },
+          },
+        },
+        classe: {
+          include: { matieres: { orderBy: { nom: 'asc' } } },
+        },
+      },
+      orderBy: [{ classe: { nom: 'asc' } }, { eleve: { nom: 'asc' } }],
+    });
+
+    const eleves = inscriptions.map((ins) => {
+      const matieres = ins.classe.matieres.map((mat) => {
+        const notesMatiere = ins.eleve.notes.filter((n) => n.matiereId === mat.id);
+        const result = buildMatiereResult(mat, notesMatiere);
+        return {
+          id: result.id,
+          nom: result.nom,
+          coefficient: result.coefficient,
+          d1: result.d1,
+          d2: result.d2,
+          compo: result.compo,
+          moyenne: result.moyenne,
+          appreciation: result.appreciation,
+        };
+      });
+
+      const moyenneGenerale = computeGeneralAverage(matieres);
+
+      return {
+        eleveId: ins.eleve.id,
+        matricule: ins.eleve.matricule,
+        nom: ins.eleve.nom,
+        prenom: ins.eleve.prenom,
+        classeId: ins.classe.id,
+        classe: ins.classe.nom,
+        niveau: ins.classe.niveau,
+        annee_scolaire: ins.annee_scolaire,
+        matieres,
+        moyenneGenerale,
+        rang: null,
+      };
+    });
+
+    assignRanksByGroup(eleves, 'classeId', (e) => e.moyenneGenerale);
+
+    res.json({
+      total: eleves.length,
+      eleves,
+    });
+  } catch (error) {
+    console.error('Erreur consultation notes:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// ═══════════════════════════════════════════════
 //  RESULTATS (Results / Bulletins) ROUTES
 // ═══════════════════════════════════════════════
 
@@ -619,24 +715,10 @@ app.get('/api/admin/classes/:id/bulletins', async (req, res) => {
       const eleve = ins.eleve;
       const notesParMatiere = classe.matieres.map(mat => {
         const notesEleve = eleve.notes.filter(n => n.matiereId === mat.id);
-        const moyMatiere = notesEleve.length > 0
-          ? (notesEleve.reduce((s, n) => s + n.valeur, 0) / notesEleve.length).toFixed(2)
-          : null;
-        return {
-          matiereId: mat.id,
-          matiere: mat.nom,
-          coefficient: mat.coefficient,
-          professeur: `${mat.professeur.prenom} ${mat.professeur.nom}`,
-          notes: notesEleve.map(n => ({ id: n.id, valeur: n.valeur, type: n.type_evaluation, appreciation: n.appreciation })),
-          moyenne: moyMatiere
-        };
+        return buildMatiereResult(mat, notesEleve);
       });
 
-      // Calculate general average (weighted)
-      const matiereAvecMoyenne = notesParMatiere.filter(m => m.moyenne !== null);
-      const totalCoeff = matiereAvecMoyenne.reduce((s, m) => s + m.coefficient, 0);
-      const totalPoints = matiereAvecMoyenne.reduce((s, m) => s + (parseFloat(m.moyenne) * m.coefficient), 0);
-      const moyenneGenerale = totalCoeff > 0 ? (totalPoints / totalCoeff).toFixed(2) : null;
+      const moyenneGenerale = computeGeneralAverage(notesParMatiere);
 
       return {
         eleveId: eleve.id,
@@ -644,15 +726,12 @@ app.get('/api/admin/classes/:id/bulletins', async (req, res) => {
         prenom: eleve.prenom,
         matricule: eleve.matricule,
         matieres: notesParMatiere,
-        moyenneGenerale
+        moyenneGenerale,
+        rang: null,
       };
     });
 
-    // Calculate class rank
-    const sorted = [...bulletins].filter(b => b.moyenneGenerale !== null).sort((a, b) => parseFloat(b.moyenneGenerale) - parseFloat(a.moyenneGenerale));
-    bulletins.forEach(b => {
-      b.rang = sorted.findIndex(s => s.eleveId === b.eleveId) + 1 || '-';
-    });
+    assignRanks(bulletins, (b) => b.moyenneGenerale);
 
     res.json({ classe: classe.nom, niveau: classe.niveau, bulletins });
   } catch (e) {
@@ -680,17 +759,28 @@ app.get('/api/admin/classes/:id/results', async (req, res) => {
       }
     });
 
-    // Calculate averages (simplified for example)
     const resultats = inscriptions.map(ins => {
-      const notes = ins.eleve.notes;
-      const totalCoeff = notes.reduce((sum, n) => sum + n.matiere.coefficient, 0);
-      const totalPoints = notes.reduce((sum, n) => sum + (n.valeur * n.matiere.coefficient), 0);
-      const moyenne = totalCoeff > 0 ? (totalPoints / totalCoeff).toFixed(2) : 'N/A';
+      const notesParMatiere = {};
+      ins.eleve.notes.forEach((n) => {
+        if (!notesParMatiere[n.matiereId]) notesParMatiere[n.matiereId] = [];
+        notesParMatiere[n.matiereId].push(n);
+      });
+
+      const matieres = Object.values(notesParMatiere).map((notes) => {
+        const matiere = notes[0].matiere;
+        return {
+          coefficient: matiere.coefficient,
+          moyenne: computeSubjectAverageFromNotes(notes),
+        };
+      });
+
+      const moyenneValue = computeGeneralAverage(matieres);
+      const moyenne = moyenneValue !== null ? moyenneValue.toFixed(2) : 'N/A';
 
       return {
         eleve: `${ins.eleve.prenom} ${ins.eleve.nom}`,
         moyenne,
-        details: notes.map(n => ({
+        details: ins.eleve.notes.map(n => ({
           matiere: n.matiere.nom,
           note: n.valeur,
           appreciation: n.appreciation
@@ -705,46 +795,74 @@ app.get('/api/admin/classes/:id/results', async (req, res) => {
   }
 });
 
-// Add a Teacher (creates User and Professeur)
+// Add a Teacher (creates Utilisateur + Professeur)
 app.post('/api/admin/professeurs', async (req, res) => {
-  const { nom, prenom, email, specialite, contact, matieresIds } = req.body;
+  const { nom, prenom, email, specialite, contact, matieresIds, mot_de_passe } = req.body;
+
+  if (!nom?.trim() || !prenom?.trim() || !email?.trim()) {
+    return res.status(400).json({ error: 'Nom, prénom et email sont requis.' });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+
   try {
-    const hashedPassword = await bcrypt.hash('Prof2024', 10);
-    
-    // Create User AND Professeur in a transaction
-    const newProf = await prisma.$transaction(async (tx) => {
+    const existingUser = await prisma.utilisateur.findUnique({
+      where: { email: normalizedEmail },
+    });
+    if (existingUser) {
+      return res.status(409).json({ error: 'Un compte existe déjà avec cet email.' });
+    }
+
+    const tempPassword = mot_de_passe?.trim() || 'Prof2024';
+    const hashedPassword = await bcrypt.hash(tempPassword, 10);
+
+    const professeur = await prisma.$transaction(async (tx) => {
       const user = await tx.utilisateur.create({
         data: {
-          nom: `${prenom} ${nom}`,
-          email,
+          nom: `${prenom.trim()} ${nom.trim()}`,
+          email: normalizedEmail,
           mot_de_passe: hashedPassword,
-          role: 'PROFESSEUR'
-        }
+          role: 'PROFESSEUR',
+        },
       });
-      
+
       const prof = await tx.professeur.create({
         data: {
           utilisateurId: user.id,
-          nom,
-          prenom,
-          specialite,
-          contact
-        }
+          nom: nom.trim(),
+          prenom: prenom.trim(),
+          specialite: specialite?.trim() || null,
+          contact: contact?.trim() || null,
+        },
       });
 
       if (matieresIds && matieresIds.length > 0) {
         await tx.matiere.updateMany({
-          where: { id: { in: matieresIds } },
-          data: { professeurId: prof.id }
+          where: { id: { in: matieresIds.map((id) => parseInt(id, 10)) } },
+          data: { professeurId: prof.id },
         });
       }
 
-      return prof;
+      return tx.professeur.findUnique({
+        where: { id: prof.id },
+        include: {
+          utilisateur: { select: { id: true, email: true, nom: true, role: true, createdAt: true } },
+          matieres: { include: { classe: true } },
+        },
+      });
     });
-    
-    res.json({ message: 'Professeur créé avec succès', professeur: newProf });
+
+    res.status(201).json({
+      message: 'Professeur et compte utilisateur créés avec succès.',
+      professeur,
+      utilisateur: professeur.utilisateur,
+      motDePasseTemporaire: mot_de_passe ? undefined : tempPassword,
+    });
   } catch (error) {
-    console.error("Erreur création prof:", error);
+    console.error('Erreur création prof:', error);
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: 'Un compte existe déjà avec cet email.' });
+    }
     res.status(500).json({ error: 'Erreur interne.' });
   }
 });
@@ -779,19 +897,34 @@ app.put('/api/admin/professeurs/:id/affectations', async (req, res) => {
 
 // --- TEACHER ROUTES ---
 
+async function getProfesseurFromRequest(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) return null;
+
+  try {
+    const token = authHeader.slice(7);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+    return prisma.professeur.findFirst({
+      where: { utilisateurId: decoded.id },
+      include: { utilisateur: true },
+    });
+  } catch {
+    return null;
+  }
+}
+
 // Get Teacher's assigned classes and subjects
 app.get('/api/teacher/matieres', async (req, res) => {
   try {
-    // For demo purposes: find the first Professeur if ID not provided
-    const prof = await prisma.professeur.findFirst();
-    if (!prof) return res.status(404).json({ error: 'Aucun professeur trouvé' });
+    const prof = await getProfesseurFromRequest(req);
+    if (!prof) return res.status(401).json({ error: 'Non authentifié ou profil enseignant introuvable.' });
 
     const matieres = await prisma.matiere.findMany({
       where: { professeurId: prof.id },
       include: { classe: true }
     });
 
-    res.json({ matieres });
+    res.json({ professeur: { id: prof.id, nom: prof.nom, prenom: prof.prenom }, matieres });
   } catch (error) {
     res.status(500).json({ error: 'Erreur interne.' });
   }
@@ -885,13 +1018,12 @@ app.post('/api/admin/resultats/calculer', async (req, res) => {
       let totalCoefs = 0;
 
       for (const matiere of matieres) {
-        // Average note for this subject for this student in this period
         const notes = await prisma.note.findMany({
           where: { eleveId: ins.eleveId, matiereId: matiere.id, periode, annee_scolaire }
         });
 
-        if (notes.length > 0) {
-          const avgSubject = notes.reduce((acc, n) => acc + n.valeur, 0) / notes.length;
+        const avgSubject = computeSubjectAverageFromNotes(notes);
+        if (avgSubject !== null) {
           totalPoints += avgSubject * matiere.coefficient;
           totalCoefs += matiere.coefficient;
         }
