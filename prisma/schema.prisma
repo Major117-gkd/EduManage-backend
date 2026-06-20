@@ -14,10 +14,118 @@ datasource db {
 }
 
 model Utilisateur {
-  id        Int      @id @default(autoincrement())
-  nom       String
-  email     String   @unique
+  id           Int      @id @default(autoincrement())
+  nom          String
+  email        String   @unique
   mot_de_passe String
-  role      String
+  role         String   // ADMIN, PROFESSEUR, PARENT
+  createdAt    DateTime @default(now())
+
+  professeur   Professeur?
+}
+
+model Eleve {
+  id              Int           @id @default(autoincrement())
+  matricule       String        @unique
+  nom             String
+  prenom          String
+  date_naissance  DateTime?
+  adresse         String?
+  parent_nom      String?
+  parent_telephone String?
+  parent_email    String?
+  filiation       String?       // e.g. "Père", "Mère", "Tuteur"
+  infos_importantes String?     // e.g. "Allergique à l'arachide", "Asthme"
+  inscriptions    Inscription[]
+  notes           Note[]
+  resultats       Resultat[]
+  createdAt       DateTime      @default(now())
+}
+
+model Professeur {
+  id             Int          @id @default(autoincrement())
+  utilisateurId  Int          @unique
+  nom            String
+  prenom         String
+  specialite     String?
+  contact        String?
+  matieres       Matiere[]
+  createdAt      DateTime     @default(now())
+
+  utilisateur    Utilisateur  @relation(fields: [utilisateurId], references: [id], onDelete: Cascade)
+}
+
+model AnneeScolaire {
+  id        Int      @id @default(autoincrement())
+  nom       String   @unique // ex: 2024-2025
+  active    Boolean  @default(false)
+  classes   Classe[]
+  createdAt DateTime @default(now())
+}
+
+model Classe {
+  id           Int           @id @default(autoincrement())
+  nom          String        // ex: 6ème A
+  niveau       String        // ex: Collège
+  capacite        Int           @default(30)
+  anneeScolaireId Int?
+  anneeScolaire   AnneeScolaire? @relation(fields: [anneeScolaireId], references: [id])
+  inscriptions    Inscription[]
+  matieres        Matiere[]
+  resultats       Resultat[]
+  createdAt       DateTime      @default(now())
+}
+
+model Inscription {
+  id             Int      @id @default(autoincrement())
+  eleveId        Int
+  classeId       Int
+  annee_scolaire String   // ex: 2023-2024
+  statut         String   // En attente, Validé, Rejeté
+  date_demande   DateTime @default(now())
+
+  eleve          Eleve    @relation(fields: [eleveId], references: [id])
+  classe         Classe   @relation(fields: [classeId], references: [id])
+}
+
+model Matiere {
+  id           Int         @id @default(autoincrement())
+  nom          String
+  coefficient  Float       @default(1)
+  professeurId Int?
+  classeId     Int?
+  notes        Note[]
+
+  professeur   Professeur?  @relation(fields: [professeurId], references: [id])
+  classe       Classe?     @relation(fields: [classeId], references: [id])
+}
+
+model Note {
+  id              Int      @id @default(autoincrement())
+  valeur          Float    // ex: 15.5
+  appreciation    String?
+  type_evaluation String   // ex: "Devoir", "Composition"
+  periode         String   // ex: "Trimestre 1"
+  annee_scolaire  String   // ex: "2024-2025"
+  eleveId         Int
+  matiereId       Int
+  date_saisie     DateTime @default(now())
+
+  eleve           Eleve    @relation(fields: [eleveId], references: [id])
+  matiere         Matiere  @relation(fields: [matiereId], references: [id])
+}
+
+model Resultat {
+  id             Int      @id @default(autoincrement())
+  eleveId        Int
+  classeId       Int
+  annee_scolaire String
+  periode        String   // ex: "Trimestre 1", "Annuel"
+  moyenne        Float
+  appreciation   String?
+  createdAt      DateTime @default(now())
+
+  eleve          Eleve    @relation(fields: [eleveId], references: [id])
+  classe         Classe   @relation(fields: [classeId], references: [id])
 }
 
