@@ -37,9 +37,14 @@ model Eleve {
   parent_email    String?
   filiation       String?       // e.g. "Père", "Mère", "Tuteur"
   infos_importantes String?     // e.g. "Allergique à l'arachide", "Asthme"
+  solde           Float         @default(0)  // Montant dû par l'élève
+  statut_financier String       @default("En attente")  // "À jour", "En retard", "À jour partiel", "En attente"
+  exception_paiement_mensuel Boolean @default(false) // Si true, paiement mensuel autorisé au lieu de tranches de 3 mois
   inscriptions    Inscription[]
   notes           Note[]
   resultats       Resultat[]
+  paiements       Paiement[]
+  statut          String        @default("Actif")
   createdAt       DateTime      @default(now())
 }
 
@@ -67,8 +72,10 @@ model AnneeScolaire {
 model Classe {
   id           Int           @id @default(autoincrement())
   nom          String        // ex: 6ème A
-  niveau       String        // ex: Collège
+  niveau       String        // ex: 6ème
+  cycle        String        @default("Collège") // Primaire, Collège, Lycée
   capacite        Int           @default(30)
+  montant_annuel Float        @default(0) // Montant annuel fixe pour cette classe (ex: 900000 FCFA pour 9 mois)
   anneeScolaireId Int?
   anneeScolaire   AnneeScolaire? @relation(fields: [anneeScolaireId], references: [id])
   inscriptions    Inscription[]
@@ -130,3 +137,18 @@ model Resultat {
   classe         Classe   @relation(fields: [classeId], references: [id])
 }
 
+model Paiement {
+  id              Int      @id @default(autoincrement())
+  eleveId         Int
+  montant         Float
+  mode_paiement   String   // "Espèces", "Chèque", "Virement", "Orange Money", etc.
+  periode         String   // "Septembre", "Octobre", "Tranche 1", "Tranche 2", etc.
+  date_paiement   DateTime @default(now())
+  annee_scolaire  String
+  reference       String?  // Numéro de reçu ou référence
+  enregistre_par  Int?     // ID de l'utilisateur qui a enregistré le paiement
+  notes           String?  // Notes additionnelles
+  createdAt       DateTime @default(now())
+
+  eleve           Eleve    @relation(fields: [eleveId], references: [id])
+}

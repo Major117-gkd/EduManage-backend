@@ -18,6 +18,145 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- MIDDLEWARES ---
+
+// Helper function to check if a student is "up to date" with payments
+const isStudentUpToDate = async (eleveId, annee_scolaire) => {
+  try {
+    const eleve = await prisma.eleve.findUnique({
+      where: { id: eleveId },
+      include: {
+        inscriptions: {
+          where: { annee_scolaire },
+          include: { classe: true }
+        },
+        paiements: {
+          where: { annee_scolaire },
+          orderBy: { date_paiement: 'desc' }
+        }
+      }
+    });
+
+    if (!eleve) return false;
+
+    // Get the current month (1-12)
+    const currentMonth = new Date().getMonth() + 1;
+
+    // Determine which tranche we're in (based on 9-month school year)
+    // School year typically: September (9) to May (5)
+    // Tranche 1: Sept-Oct-Nov (9,10,11)
+    // Tranche 2: Dec-Jan-Feb (12,1,2)
+    // Tranche 3: Mar-Apr-May (3,4,5)
+    let currentTranche, trancheMonths;
+    if (currentMonth >= 9) {
+      currentTranche = 1;
+      trancheMonths = [9, 10, 11];
+    } else if (currentMonth >= 6) {
+      // Summer months - no school
+      return true;
+    } else if (currentMonth >= 3) {
+      currentTranche = 3;
+      trancheMonths = [3, 4, 5];
+    } else if (currentMonth >= 1) {
+      currentTranche = 2;
+      trancheMonths = [12, 1, 2];
+    } else {
+      return true;
+    }
+
+    // Get the student's class to determine annual amount
+    const inscription = eleve.inscriptions[0];
+    if (!inscription) return false;
+
+    const annualAmount = inscription.classe.montant_annuel || 0;
+    if (annualAmount === 0) return true; // No fees configured
+
+    // Calculate monthly amount (9-month school year)
+    const monthlyAmount = annualAmount / 9;
+
+    // Calculate expected payment for current period
+    let expectedAmount = 0;
+
+    if (eleve.exception_paiement_mensuel) {
+      // Monthly payment exception: only need current month
+      expectedAmount = monthlyAmount;
+    } else {
+      // Default: need to pay the entire tranche (3 months)
+      expectedAmount = monthlyAmount * trancheMonths.length;
+    }
+
+    // Calculate total paid for the current period
+    const paidAmount = eleve.paiements.reduce((sum, p) => {
+      const paymentMonth = new Date(p.date_paiement).getMonth() + 1;
+      if (eleve.exception_paiement_mensuel) {
+        // Only count current month payments
+        return paymentMonth === currentMonth ? sum + p.montant : sum;
+      } else {
+        // Count all payments in the current tranche
+        return trancheMonths.includes(paymentMonth) ? sum + p.montant : sum;
+      }
+    }, 0);
+
+    // Student is up to date if they've paid the expected amount
+    return paidAmount >= expectedAmount;
+  } catch (error) {
+    console.error('Error checking payment status:', error);
+    return false;
+  }
+};
+
+// Middleware to verify payment status before accessing grades
+const checkPaymentStatus = async (req, res, next) => {
+  try {
+    // Skip payment check for admins and teachers
+    const authHeader = req.headers.authorization;
+    if (authHeader) {
+      const token = authHeader.split(' ')[1];
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+      if (decoded.role === 'ADMIN' || decoded.role === 'PROFESSEUR') {
+        return next();
+      }
+    }
+
+    // For students/parents, check payment status
+    const { eleveId } = req.params;
+    const { eleveId: queryEleveId } = req.query;
+    const { eleveId: bodyEleveId } = req.body || {};
+    const { annee_scolaire } = req.query;
+
+    const targetEleveId = eleveId || queryEleveId || bodyEleveId;
+
+    if (!targetEleveId) {
+      return next(); // No student ID provided, skip check
+    }
+
+    // Use the new helper function to check if student is up to date
+    const currentYear = annee_scolaire || '2024-2025';
+    const isUpToDate = await isStudentUpToDate(parseInt(targetEleveId), currentYear);
+
+    if (!isUpToDate) {
+      const eleve = await prisma.eleve.findUnique({
+        where: { id: parseInt(targetEleveId) },
+        select: { exception_paiement_mensuel: true }
+      });
+
+      const periodType = eleve?.exception_paiement_mensuel ? 'mensualité' : 'tranche de 3 mois';
+      
+      return res.status(403).json({
+        error: 'Accès refusé',
+        message: `Veuillez régler votre ${periodType} en cours pour accéder à vos notes`,
+        exception_paiement_mensuel: eleve?.exception_paiement_mensuel || false
+      });
+    }
+
+    next();
+  } catch (error) {
+    console.error('Erreur vérification statut paiement:', error);
+    // If there's an error (e.g., invalid token), allow access to avoid blocking legitimate requests
+    next();
+  }
+};
+
 // --- ROUTES ---
 
 // Route de connexion
@@ -94,8 +233,10 @@ app.get('/api/admin/professeurs', async (req, res) => {
 
 // LIST all Eleves
 app.get('/api/admin/eleves', async (req, res) => {
+  const { show_inactive } = req.query;
   try {
     const eleves = await prisma.eleve.findMany({
+      where: show_inactive === 'true' ? {} : { statut: 'Actif' },
       orderBy: { createdAt: 'desc' },
       include: {
         inscriptions: {
@@ -111,7 +252,7 @@ app.get('/api/admin/eleves', async (req, res) => {
 
 // CREATE a new Eleve and his Inscription
 app.post('/api/admin/eleves', async (req, res) => {
-  const { nom, prenom, date_naissance, adresse, parent_nom, parent_telephone, parent_email, filiation, infos_importantes, classeId, annee_scolaire, matricule, photoUrl } = req.body;
+  const { nom, prenom, date_naissance, adresse, parent_nom, parent_telephone, parent_email, filiation, infos_importantes, classeId, annee_scolaire, matricule, photoUrl, exception_paiement_mensuel } = req.body;
   try {
     // Generate a unique matricule if not provided
     const count = await prisma.eleve.count();
@@ -119,7 +260,20 @@ app.post('/api/admin/eleves', async (req, res) => {
 
     const eleve = await prisma.$transaction(async (tx) => {
       const newEleve = await tx.eleve.create({
-        data: { matricule: finalMatricule, nom, prenom, date_naissance: date_naissance ? new Date(date_naissance) : null, adresse, parent_nom, parent_telephone, parent_email, filiation, infos_importantes, photoUrl }
+        data: { 
+          matricule: finalMatricule, 
+          nom, 
+          prenom, 
+          date_naissance: date_naissance ? new Date(date_naissance) : null, 
+          adresse, 
+          parent_nom, 
+          parent_telephone, 
+          parent_email, 
+          filiation, 
+          infos_importantes, 
+          photoUrl,
+          exception_paiement_mensuel: exception_paiement_mensuel || false
+        }
       });
       await tx.inscription.create({
         data: {
@@ -141,7 +295,7 @@ app.post('/api/admin/eleves', async (req, res) => {
 
 // UPDATE an Eleve
 app.put('/api/admin/eleves/:id', async (req, res) => {
-  const { prenom, nom, date_naissance, adresse, parent_nom, filiation, parent_telephone, parent_email, infos_importantes, photoUrl } = req.body;
+  const { prenom, nom, date_naissance, adresse, parent_nom, filiation, parent_telephone, parent_email, infos_importantes, photoUrl, exception_paiement_mensuel } = req.body;
   const eleveId = parseInt(req.params.id);
   try {
     const eleve = await prisma.eleve.update({
@@ -149,7 +303,8 @@ app.put('/api/admin/eleves/:id', async (req, res) => {
       data: {
         prenom, nom, 
         date_naissance: date_naissance ? new Date(date_naissance) : null,
-        adresse, parent_nom, filiation, parent_telephone, parent_email, infos_importantes, photoUrl
+        adresse, parent_nom, filiation, parent_telephone, parent_email, infos_importantes, photoUrl,
+        exception_paiement_mensuel: exception_paiement_mensuel !== undefined ? exception_paiement_mensuel : undefined
       }
     });
     res.json({ message: 'Élève mis à jour avec succès', eleve });
@@ -159,19 +314,17 @@ app.put('/api/admin/eleves/:id', async (req, res) => {
   }
 });
 
-// DELETE an Eleve
+// DELETE (soft delete) an Eleve
 app.delete('/api/admin/eleves/:id', async (req, res) => {
   const eleveId = parseInt(req.params.id);
   try {
-    await prisma.$transaction(async (tx) => {
-      await tx.note.deleteMany({ where: { eleveId } });
-      await tx.resultat.deleteMany({ where: { eleveId } });
-      await tx.inscription.deleteMany({ where: { eleveId } });
-      await tx.eleve.delete({ where: { id: eleveId } });
+    await prisma.eleve.update({
+      where: { id: eleveId },
+      data: { statut: 'Inactif' }
     });
-    res.json({ message: 'Élève supprimé avec succès' });
+    res.json({ message: 'Élève marqué comme inactif avec succès' });
   } catch (error) {
-    console.error('Erreur suppression élève:', error);
+    console.error('Erreur désactivation élève:', error);
     res.status(500).json({ error: 'Erreur interne.' });
   }
 });
@@ -181,6 +334,25 @@ app.post('/api/admin/eleves/:id/reinscription', async (req, res) => {
   const { classeId, annee_scolaire } = req.body;
   const eleveId = parseInt(req.params.id);
   try {
+    // Check student's balance before allowing re-registration
+    const eleve = await prisma.eleve.findUnique({
+      where: { id: eleveId },
+      select: { solde: true, nom: true, prenom: true }
+    });
+
+    if (!eleve) {
+      return res.status(404).json({ error: 'Élève non trouvé' });
+    }
+
+    // Block re-registration if student has outstanding debt
+    if (eleve.solde > 0) {
+      return res.status(403).json({
+        error: 'Dette non soldée',
+        message: `Impossible de réinscrire cet élève : dette de l'année précédente non soldée (${eleve.solde.toLocaleString()} FCFA)`,
+        solde: eleve.solde
+      });
+    }
+
     const inscription = await prisma.inscription.create({
       data: {
         eleveId,
@@ -259,13 +431,15 @@ app.get('/api/admin/classes', async (req, res) => {
 });
 
 app.post('/api/admin/classes', async (req, res) => {
-  const { nom, niveau, capacite, anneeScolaireId } = req.body;
+  const { nom, niveau, cycle, capacite, montant_annuel, anneeScolaireId } = req.body;
   try {
     const newClass = await prisma.classe.create({
       data: {
         nom,
         niveau,
+        cycle: cycle || 'Collège',
         capacite: parseInt(capacite) || 30,
+        montant_annuel: parseFloat(montant_annuel) || 0,
         anneeScolaireId: anneeScolaireId ? parseInt(anneeScolaireId) : null
       }
     });
@@ -277,20 +451,22 @@ app.post('/api/admin/classes', async (req, res) => {
 });
 app.put('/api/admin/classes/:id', async (req, res) => {
   const id = parseInt(req.params.id);
-  const { nom, niveau, capacite, anneeScolaireId } = req.body;
+  const { nom, niveau, cycle, capacite, montant_annuel, anneeScolaireId } = req.body;
   try {
     const updatedClass = await prisma.classe.update({
       where: { id },
       data: {
         nom,
         niveau,
-        capacite: parseInt(capacite) || 30,
+        cycle: cycle || 'Collège',
+        capacite: capacite ? parseInt(capacite) : undefined,
+        montant_annuel: montant_annuel !== undefined ? parseFloat(montant_annuel) : undefined,
         anneeScolaireId: anneeScolaireId ? parseInt(anneeScolaireId) : null
       }
     });
     res.json(updatedClass);
   } catch (error) {
-    console.error("Erreur modification classe:", error);
+    console.error("Erreur mise à jour classe:", error);
     res.status(500).json({ error: 'Erreur interne.' });
   }
 });
@@ -308,7 +484,9 @@ app.delete('/api/admin/classes/:id', async (req, res) => {
 
 app.get('/api/admin/stats', async (req, res) => {
   try {
-    const totalEleves = await prisma.eleve.count();
+    const totalEleves = await prisma.eleve.count({
+      where: { statut: 'Actif' }
+    });
     const totalProfesseurs = await prisma.professeur.count();
     const totalClasses = await prisma.classe.count();
     const inscriptionsAttente = await prisma.inscription.count({
@@ -337,10 +515,10 @@ app.get('/api/admin/chart-data', async (req, res) => {
       }
     });
 
-    const levelCounts = { 'Maternelle': 0, 'Primaire': 0, 'Collège': 0, 'Lycée': 0 };
+    const levelCounts = { 'Primaire': 0, 'Collège': 0, 'Lycée': 0 };
     classes.forEach(c => {
-      if (levelCounts[c.niveau] !== undefined) {
-        levelCounts[c.niveau] += c._count.inscriptions;
+      if (levelCounts[c.cycle] !== undefined) {
+        levelCounts[c.cycle] += c._count.inscriptions;
       }
     });
     
@@ -502,7 +680,7 @@ app.delete('/api/admin/matieres/:id', async (req, res) => {
 // ═══════════════════════════════════════════════
 
 // Get students of a class with their notes for a subject
-app.get('/api/admin/classes/:classeId/matieres/:matiereId/notes', async (req, res) => {
+app.get('/api/admin/classes/:classeId/matieres/:matiereId/notes', checkPaymentStatus, async (req, res) => {
   const classeId = parseInt(req.params.classeId);
   const matiereId = parseInt(req.params.matiereId);
   const { periode, annee_scolaire } = req.query;
@@ -602,7 +780,7 @@ app.delete('/api/admin/notes/:id', async (req, res) => {
 //  CONSULTATION (Read-only grades overview)
 // ═══════════════════════════════════════════════
 
-app.get('/api/admin/notes/consultation', async (req, res) => {
+app.get('/api/admin/notes/consultation', checkPaymentStatus, async (req, res) => {
   const { annee_scolaire, periode, classeId, niveau } = req.query;
 
   try {
@@ -681,7 +859,7 @@ app.get('/api/admin/notes/consultation', async (req, res) => {
 // ═══════════════════════════════════════════════
 
 // Get full results for a class (bulletin data)
-app.get('/api/admin/classes/:id/bulletins', async (req, res) => {
+app.get('/api/admin/classes/:id/bulletins', checkPaymentStatus, async (req, res) => {
   const classeId = parseInt(req.params.id);
   const { periode } = req.query;
 
@@ -697,7 +875,13 @@ app.get('/api/admin/classes/:id/bulletins', async (req, res) => {
       where: { classeId, statut: 'Validé' },
       include: {
         eleve: {
-          include: {
+          select: {
+            id: true,
+            nom: true,
+            prenom: true,
+            matricule: true,
+            solde: true,
+            statut_financier: true,
             notes: {
               where: {
                 ...(periode ? { periode } : {}),
@@ -725,6 +909,8 @@ app.get('/api/admin/classes/:id/bulletins', async (req, res) => {
         nom: eleve.nom,
         prenom: eleve.prenom,
         matricule: eleve.matricule,
+        solde: eleve.solde,
+        statut_financier: eleve.statut_financier,
         matieres: notesParMatiere,
         moyenneGenerale,
         rang: null,
@@ -1068,7 +1254,7 @@ app.get('/api/admin/taux-reussite', async (req, res) => {
 
     for (const niveau of niveaux) {
       // Get all classes for this level
-      const classes = await prisma.classe.findMany({ where: { niveau } });
+      const classes = await prisma.classe.findMany({ where: { cycle: niveau } });
       const classeIds = classes.map(c => c.id);
 
       if (classeIds.length === 0) {
@@ -1104,6 +1290,267 @@ app.get('/api/admin/taux-reussite', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Erreur taux réussite:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// --- PAIEMENTS ROUTES ---
+
+// CREATE a new Paiement
+app.post('/api/paiements', async (req, res) => {
+  const { eleveId, montant, mode_paiement, periode, annee_scolaire, reference, enregistre_par, notes } = req.body;
+  try {
+    const paiement = await prisma.$transaction(async (tx) => {
+      // Get student info with class and exception status
+      const eleve = await tx.eleve.findUnique({
+        where: { id: parseInt(eleveId) },
+        include: {
+          inscriptions: {
+            where: { annee_scolaire },
+            include: { classe: true }
+          }
+        }
+      });
+
+      if (!eleve) {
+        throw new Error('Élève non trouvé');
+      }
+
+      // Calculate expected amount based on tranche system
+      const inscription = eleve.inscriptions[0];
+      const annualAmount = inscription?.classe?.montant_annuel || 0;
+      const monthlyAmount = annualAmount / 9; // 9-month school year
+
+      let expectedAmount = parseFloat(montant);
+
+      // If no amount provided, calculate based on tranche system
+      if (!montant && monthlyAmount > 0) {
+        if (eleve.exception_paiement_mensuel) {
+          // Monthly exception: single month amount
+          expectedAmount = monthlyAmount;
+        } else {
+          // Default: 3-month tranche
+          expectedAmount = monthlyAmount * 3;
+        }
+      }
+
+      // Create the payment
+      const newPaiement = await tx.paiement.create({
+        data: {
+          eleveId: parseInt(eleveId),
+          montant: expectedAmount,
+          mode_paiement,
+          periode,
+          annee_scolaire,
+          reference,
+          enregistre_par: enregistre_par ? parseInt(enregistre_par) : null,
+          notes
+        }
+      });
+
+      // Update student's balance (reduce debt)
+      const newSolde = (eleve.solde || 0) - expectedAmount;
+
+      // Determine financial status based on new tranche logic
+      const isUpToDate = await isStudentUpToDate(parseInt(eleveId), annee_scolaire);
+      const newStatutFinancier = isUpToDate ? "À jour" : (newSolde < 0 ? "À jour partiel" : "En retard");
+
+      await tx.eleve.update({
+        where: { id: parseInt(eleveId) },
+        data: {
+          solde: newSolde,
+          statut_financier: newStatutFinancier
+        }
+      });
+
+      return newPaiement;
+    });
+
+    res.json({ message: 'Paiement enregistré avec succès', paiement });
+  } catch (error) {
+    console.error('Erreur création paiement:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// GET all Paiements (admin)
+app.get('/api/paiements', async (req, res) => {
+  const { eleveId, annee_scolaire } = req.query;
+  try {
+    const where = {};
+    if (eleveId) where.eleveId = parseInt(eleveId);
+    if (annee_scolaire) where.annee_scolaire = annee_scolaire;
+
+    const paiements = await prisma.paiement.findMany({
+      where,
+      include: {
+        eleve: {
+          select: {
+            id: true,
+            nom: true,
+            prenom: true,
+            matricule: true
+          }
+        }
+      },
+      orderBy: { date_paiement: 'desc' }
+    });
+    res.json(paiements);
+  } catch (error) {
+    console.error('Erreur récupération paiements:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// GET Paiements by Eleve ID
+app.get('/api/paiements/eleve/:id', async (req, res) => {
+  const eleveId = parseInt(req.params.id);
+  const { annee_scolaire } = req.query;
+  try {
+    const where = { eleveId };
+    if (annee_scolaire) where.annee_scolaire = annee_scolaire;
+
+    const paiements = await prisma.paiement.findMany({
+      where,
+      orderBy: { date_paiement: 'desc' }
+    });
+    res.json(paiements);
+  } catch (error) {
+    console.error('Erreur récupération paiements élève:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// GET Paiement status for an Eleve
+app.get('/api/paiements/statut/:eleveId', async (req, res) => {
+  const eleveId = parseInt(req.params.eleveId);
+  const { annee_scolaire } = req.query;
+  try {
+    const eleve = await prisma.eleve.findUnique({
+      where: { id: eleveId },
+      select: {
+        id: true,
+        nom: true,
+        prenom: true,
+        solde: true,
+        statut_financier: true
+      }
+    });
+
+    if (!eleve) {
+      return res.status(404).json({ error: 'Élève non trouvé' });
+    }
+
+    // Get payments for the specified academic year
+    const where = { eleveId };
+    if (annee_scolaire) where.annee_scolaire = annee_scolaire;
+
+    const paiements = await prisma.paiement.findMany({
+      where,
+      orderBy: { date_paiement: 'desc' }
+    });
+
+    res.json({
+      eleve,
+      paiements,
+      peutVoirNotes: eleve.statut_financier === 'À jour'
+    });
+  } catch (error) {
+    console.error('Erreur vérification statut paiement:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// UPDATE a Paiement
+app.put('/api/paiements/:id', async (req, res) => {
+  const paiementId = parseInt(req.params.id);
+  const { montant, mode_paiement, periode, reference, notes } = req.body;
+  try {
+    const paiement = await prisma.paiement.update({
+      where: { id: paiementId },
+      data: {
+        montant: montant ? parseFloat(montant) : undefined,
+        mode_paiement,
+        periode,
+        reference,
+        notes
+      }
+    });
+    res.json({ message: 'Paiement mis à jour avec succès', paiement });
+  } catch (error) {
+    console.error('Erreur mise à jour paiement:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// DELETE a Paiement
+app.delete('/api/paiements/:id', async (req, res) => {
+  const paiementId = parseInt(req.params.id);
+  try {
+    const paiement = await prisma.$transaction(async (tx) => {
+      // Get the payment to be deleted
+      const existingPaiement = await tx.paiement.findUnique({
+        where: { id: paiementId },
+        include: { eleve: true }
+      });
+
+      if (!existingPaiement) {
+        throw new Error('Paiement non trouvé');
+      }
+
+      // Delete the payment
+      await tx.paiement.delete({
+        where: { id: paiementId }
+      });
+
+      // Restore the student's balance (add back the amount)
+      const eleve = await tx.eleve.findUnique({
+        where: { id: existingPaiement.eleveId }
+      });
+
+      const newSolde = (eleve.solde || 0) + existingPaiement.montant;
+      
+      // Update financial status
+      let newStatutFinancier = "En retard";
+      if (newSolde <= 0) {
+        newStatutFinancier = "À jour";
+      } else if (newSolde > 0) {
+        newStatutFinancier = "À jour partiel";
+      }
+
+      await tx.eleve.update({
+        where: { id: existingPaiement.eleveId },
+        data: {
+          solde: newSolde,
+          statut_financier: newStatutFinancier
+        }
+      });
+
+      return existingPaiement;
+    });
+
+    res.json({ message: 'Paiement supprimé avec succès' });
+  } catch (error) {
+    console.error('Erreur suppression paiement:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// UPDATE Eleve financial status (manual adjustment)
+app.put('/api/eleves/:id/financier', async (req, res) => {
+  const eleveId = parseInt(req.params.id);
+  const { solde, statut_financier } = req.body;
+  try {
+    const eleve = await prisma.eleve.update({
+      where: { id: eleveId },
+      data: {
+        solde: solde !== undefined ? parseFloat(solde) : undefined,
+        statut_financier: statut_financier
+      }
+    });
+    res.json({ message: 'Statut financier mis à jour avec succès', eleve });
+  } catch (error) {
+    console.error('Erreur mise à jour statut financier:', error);
     res.status(500).json({ error: 'Erreur interne.' });
   }
 });

@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  postgres_db:
+    image: postgres:15-alpine # Version stable et légère
+    container_name: edumanage_postgres_container # Nom du conteneur
+    restart: always
+    environment:
+      POSTGRES_USER: postgres          # Votre nom d'utilisateur
+      POSTGRES_PASSWORD:   # Votre mot de passe
+      POSTGRES_DB: postgres        # Le nom de la base de données par défaut
+    ports:
+      - "5433:5432"                  # Associe le port 5432 du conteneur au port 5432 local
+    volumes:
+      - postgres_data:/var/lib/postgresql/data # Persistance des données
+
+volumes:
+  postgres_data: # Évite de perdre vos données quand le conteneur s'arrête
