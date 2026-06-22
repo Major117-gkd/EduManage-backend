@@ -19,9 +19,11 @@ model Utilisateur {
   email        String   @unique
   mot_de_passe String
   role         String   // ADMIN, PROFESSEUR, PARENT
+  photoUrl     String?  @db.Text
   createdAt    DateTime @default(now())
 
   professeur   Professeur?
+  notifications Notification[]
 }
 
 model Eleve {
@@ -44,7 +46,9 @@ model Eleve {
   notes           Note[]
   resultats       Resultat[]
   paiements       Paiement[]
-  statut          String        @default("Actif")
+  statut          String        @default("Actif") // Actif, Abandon, Transféré, Exclu
+  date_abandon    DateTime?
+  motif_abandon   String?
   createdAt       DateTime      @default(now())
 }
 
@@ -55,7 +59,9 @@ model Professeur {
   prenom         String
   specialite     String?
   contact        String?
+  photoUrl       String?      @db.Text
   matieres       Matiere[]
+  presences      PresenceProfesseur[]
   createdAt      DateTime     @default(now())
 
   utilisateur    Utilisateur  @relation(fields: [utilisateurId], references: [id], onDelete: Cascade)
@@ -77,11 +83,38 @@ model Classe {
   capacite        Int           @default(30)
   montant_annuel Float        @default(0) // Montant annuel fixe pour cette classe (ex: 900000 FCFA pour 9 mois)
   anneeScolaireId Int?
+  niveauEtudeId   Int?
   anneeScolaire   AnneeScolaire? @relation(fields: [anneeScolaireId], references: [id])
+  niveauEtude     NiveauEtude?   @relation(fields: [niveauEtudeId], references: [id])
   inscriptions    Inscription[]
   matieres        Matiere[]
   resultats       Resultat[]
+  tranches        TrancheClasse[]
+  tarifHoraire    TarifHoraireClasse?
+  presencesProf   PresenceProfesseur[]
   createdAt       DateTime      @default(now())
+}
+
+model NiveauEtude {
+  id          Int      @id @default(autoincrement())
+  nom         String   @unique
+  cycle       String   // Primaire, Collège, Lycée
+  ordre       Int      @default(0)
+  actif       Boolean  @default(true)
+  regleCalcul Json
+  description String?  @db.Text
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  classes     Classe[]
+}
+
+model TrancheClasse {
+  id          Int       @id @default(autoincrement())
+  nom         String    // ex: "Frais d'inscription", "Tranche 1"
+  montant     Float
+  date_limite DateTime? 
+  classeId    Int
+  classe      Classe    @relation(fields: [classeId], references: [id], onDelete: Cascade)
 }
 
 model Inscription {
@@ -103,9 +136,42 @@ model Matiere {
   professeurId Int?
   classeId     Int?
   notes        Note[]
+  presences    PresenceProfesseur[]
 
   professeur   Professeur?  @relation(fields: [professeurId], references: [id])
   classe       Classe?     @relation(fields: [classeId], references: [id])
+}
+
+model TarifHoraireClasse {
+  id            Int      @id @default(autoincrement())
+  classeId      Int      @unique
+  tarif_horaire Float
+  heures_seance Float    @default(1)
+  updatedAt     DateTime @updatedAt
+
+  classe        Classe   @relation(fields: [classeId], references: [id], onDelete: Cascade)
+}
+
+model PresenceProfesseur {
+  id             Int      @id @default(autoincrement())
+  professeurId   Int
+  matiereId      Int
+  classeId       Int
+  date_presence  DateTime @db.Date
+  nombre_heures  Float    @default(1)
+  tarif_horaire  Float
+  montant        Float
+  annee_scolaire String
+  enregistre_par Int?
+  createdAt      DateTime @default(now())
+
+  professeur     Professeur @relation(fields: [professeurId], references: [id], onDelete: Cascade)
+  matiere        Matiere    @relation(fields: [matiereId], references: [id], onDelete: Cascade)
+  classe         Classe     @relation(fields: [classeId], references: [id], onDelete: Cascade)
+
+  @@index([professeurId, annee_scolaire])
+  @@index([date_presence])
+  @@index([professeurId, classeId, date_presence])
 }
 
 model Note {
@@ -151,4 +217,41 @@ model Paiement {
   createdAt       DateTime @default(now())
 
   eleve           Eleve    @relation(fields: [eleveId], references: [id])
+}
+
+model ParametreSite {
+  id                 Int      @id @default(1)
+  nom_ecole          String   @default("GSP Elhadj Mamadou Saïdou Diallo")
+  adresse            String?
+  telephone          String?
+  email_contact      String?
+  devise             String   @default("GNF")
+  notif_inscriptions Boolean  @default(true)
+  notif_paiements    Boolean  @default(true)
+  notif_notes        Boolean  @default(true)
+  message_accueil    String?
+  mail_enabled       Boolean  @default(false)
+  smtp_host          String?  @default("smtp.gmail.com")
+  smtp_port          Int?     @default(587)
+  smtp_secure        Boolean  @default(false)
+  smtp_user          String?
+  smtp_app_password  String?
+  updatedAt          DateTime @updatedAt
+}
+
+model Notification {
+  id            Int         @id @default(autoincrement())
+  utilisateurId Int
+  type          String
+  titre         String
+  message       String      @db.Text
+  lien          String?
+  lu            Boolean     @default(false)
+  metadata      Json?
+  createdAt     DateTime    @default(now())
+
+  utilisateur   Utilisateur @relation(fields: [utilisateurId], references: [id], onDelete: Cascade)
+
+  @@index([utilisateurId, lu])
+  @@index([utilisateurId, createdAt])
 }

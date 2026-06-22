@@ -1,22 +1,26 @@
+const { normalizeRegle, DEFAULT_REGLE_CALCUL } = require('./gradeRules');
+
 /**
- * Moyenne par matière (sans coefficient de la matière).
- * Pondération interne des évaluations : D1×1, D2×1, Compo×2.
+ * Moyenne par matière selon les pondérations du niveau.
  */
-function computeSubjectAverageFromNotes(notes) {
-  const d1 = notes.find((n) => n.type_evaluation === 'Devoir 1');
-  const d2 = notes.find((n) => n.type_evaluation === 'Devoir 2');
-  const compo = notes.find((n) => n.type_evaluation === 'Composition');
+function computeSubjectAverageFromNotes(notes, regle = DEFAULT_REGLE_CALCUL) {
+  const rules = normalizeRegle(regle);
   let sum = 0;
   let weight = 0;
-  if (d1) { sum += d1.valeur; weight += 1; }
-  if (d2) { sum += d2.valeur; weight += 1; }
-  if (compo) { sum += compo.valeur * 2; weight += 2; }
+
+  rules.evaluations.forEach((ev) => {
+    const note = notes.find((n) => n.type_evaluation === ev.type);
+    if (note) {
+      sum += note.valeur * ev.poids;
+      weight += ev.poids;
+    }
+  });
+
   return weight > 0 ? Math.round((sum / weight) * 100) / 100 : null;
 }
 
 /**
  * Moyenne générale / classement : Σ(moyenne_matière × coefficient_matière) / Σ(coefficients)
- * Le coefficient de la matière n'intervient qu'à cette étape.
  */
 function computeGeneralAverage(matieres) {
   const withAverage = matieres.filter((m) => m.moyenne !== null && m.moyenne !== undefined);
@@ -27,12 +31,22 @@ function computeGeneralAverage(matieres) {
   return totalCoeff > 0 ? Math.round((totalPoints / totalCoeff) * 100) / 100 : null;
 }
 
-function buildMatiereResult(mat, notesEleve) {
-  const d1 = notesEleve.find((n) => n.type_evaluation === 'Devoir 1');
-  const d2 = notesEleve.find((n) => n.type_evaluation === 'Devoir 2');
-  const compo = notesEleve.find((n) => n.type_evaluation === 'Composition');
-  const appreciation = compo?.appreciation || d2?.appreciation || d1?.appreciation || '';
-  const moyenne = computeSubjectAverageFromNotes(notesEleve);
+function buildMatiereResult(mat, notesEleve, regle = DEFAULT_REGLE_CALCUL) {
+  const rules = normalizeRegle(regle);
+  const fields = {};
+
+  rules.evaluations.forEach((ev, index) => {
+    const note = notesEleve.find((n) => n.type_evaluation === ev.type);
+    const key = index === 0 ? 'd1' : index === 1 ? 'd2' : index === 2 ? 'compo' : `note${index}`;
+    fields[key] = note?.valeur ?? null;
+  });
+
+  const appreciationSource = [...notesEleve].reverse().find((n) => n.appreciation)
+    || notesEleve.find((n) => n.type_evaluation === 'Composition')
+    || notesEleve.find((n) => n.type_evaluation === 'Devoir 2')
+    || notesEleve.find((n) => n.type_evaluation === 'Devoir 1');
+
+  const moyenne = computeSubjectAverageFromNotes(notesEleve, rules);
 
   return {
     matiereId: mat.id,
@@ -43,9 +57,9 @@ function buildMatiereResult(mat, notesEleve) {
     professeur: mat.professeur
       ? `${mat.professeur.prenom} ${mat.professeur.nom}`
       : '—',
-    d1: d1?.valeur ?? null,
-    d2: d2?.valeur ?? null,
-    compo: compo?.valeur ?? null,
+    d1: fields.d1 ?? null,
+    d2: fields.d2 ?? null,
+    compo: fields.compo ?? null,
     notes: notesEleve.map((n) => ({
       id: n.id,
       valeur: n.valeur,
@@ -53,11 +67,10 @@ function buildMatiereResult(mat, notesEleve) {
       appreciation: n.appreciation,
     })),
     moyenne,
-    appreciation,
+    appreciation: appreciationSource?.appreciation || '',
   };
 }
 
-/** Classement par groupe (ex. par classe), avec ex-aequo. */
 function assignRanks(items, getAverage) {
   const sorted = [...items]
     .filter((item) => getAverage(item) !== null && getAverage(item) !== undefined)
