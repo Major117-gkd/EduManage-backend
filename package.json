@@ -6,6 +6,9 @@
   "scripts": {
     "start": "nodemon index.js",
     "dev": "nodemon index.js",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:setup": "node scripts/setup-database.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

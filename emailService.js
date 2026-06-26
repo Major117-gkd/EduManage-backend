@@ -136,9 +136,198 @@ function getAppLoginUrl() {
   return `${base}/login`;
 }
 
+function getLoginUrlForRole(role) {
+  const map = {
+    ADMIN: 'admin',
+    COMPTABLE: 'comptable',
+    DIRECTEUR: 'directeur',
+    PARENT: 'parent',
+    ELEVE: 'eleve',
+    PROFESSEUR: 'professeur',
+  };
+  const profil = map[role];
+  const base = getAppLoginUrl();
+  return profil ? `${base}?profil=${profil}` : base;
+}
+
+const ROLE_LABELS_FR = {
+  ADMIN: 'Administrateur',
+  COMPTABLE: 'Comptable',
+  DIRECTEUR: 'Directeur',
+  PROFESSEUR: 'Professeur',
+  PARENT: 'Parent',
+  ELEVE: 'Élève',
+};
+
+const INTERNAL_EMAIL_SUFFIXES = ['@gsp.local'];
+
+function isDeliverableEmail(email) {
+  const normalized = (email || '').trim().toLowerCase();
+  if (!normalized || !normalized.includes('@')) return false;
+  return !INTERNAL_EMAIL_SUFFIXES.some((suffix) => normalized.endsWith(suffix));
+}
+
+function wrapAccountEmailHtml({ schoolName, title, bodyHtml }) {
+  return `
+<div style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;margin:0 auto;color:#0f172a;">
+  <div style="height:4px;background:linear-gradient(90deg,#c59b27,#e8c547,#c59b27);"></div>
+  <div style="background:#0A2F6B;color:#fff;padding:20px 24px;">
+    <h1 style="margin:0;font-size:18px;">${schoolName}</h1>
+    <p style="margin:6px 0 0;font-size:13px;opacity:0.85;">${title}</p>
+  </div>
+  <div style="padding:24px;background:#fff;border:1px solid #e2e8f0;border-top:none;">
+    ${bodyHtml}
+  </div>
+  <div style="padding:12px 24px;background:#f8fafc;border:1px solid #e2e8f0;border-top:none;font-size:12px;color:#94a3b8;text-align:center;">
+    ${schoolName} · Plateforme EduManage
+  </div>
+</div>`;
+}
+
+function buildCredentialsBlock({ loginLabel, loginValue, password, loginUrl, showPassword = true }) {
+  const passwordLine = showPassword && password
+    ? `<p style="margin:0 0 8px;"><strong>Mot de passe :</strong> <code style="background:#fff;padding:2px 6px;border-radius:4px;">${password}</code></p>`
+    : '';
+  return `
+<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:16px;margin:16px 0;">
+  <p style="margin:0 0 8px;"><strong>${loginLabel} :</strong> ${loginValue}</p>
+  ${passwordLine}
+  <p style="margin:0;"><strong>Connexion :</strong> <a href="${loginUrl}" style="color:#0A2F6B;">${loginUrl}</a></p>
+</div>
+<div style="text-align:center;margin:24px 0 8px;">
+  <a href="${loginUrl}" style="display:inline-block;background:#0A2F6B;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:600;">Se connecter</a>
+</div>`;
+}
+
+function buildAccountWelcomeContent({
+  settings,
+  role,
+  nom,
+  email,
+  password,
+  perimetre,
+  eleve,
+  linkedOnly = false,
+  studentMatricule,
+}) {
+  const schoolName = settings?.nom_ecole || 'GSP Elhadj Mamadou Saïdou Diallo';
+  const roleLabel = ROLE_LABELS_FR[role] || role;
+  const loginUrl = getLoginUrlForRole(role);
+  const greetingName = (nom || email || '').split(' ')[0] || 'Bonjour';
+
+  let intro;
+  let credentialsHtml = '';
+  let credentialsText = [];
+  let subject;
+
+  if (role === 'PARENT' && linkedOnly && eleve) {
+    subject = `[${schoolName}] Nouvel enfant lié à votre espace parent`;
+    intro = `Votre espace parent a été associé à l'élève <strong>${eleve.prenom} ${eleve.nom}</strong> (matricule ${eleve.matricule}).`;
+    credentialsText = [
+      `Élève : ${eleve.prenom} ${eleve.nom}`,
+      `Matricule : ${eleve.matricule}`,
+      `Connexion : ${loginUrl}`,
+    ];
+    credentialsHtml = buildCredentialsBlock({
+      loginLabel: 'E-mail',
+      loginValue: email,
+      loginUrl,
+      showPassword: false,
+    });
+  } else if (role === 'ELEVE' && eleve) {
+    subject = `[${schoolName}] Compte élève créé — ${eleve.prenom} ${eleve.nom}`;
+    intro = `Le compte espace élève de <strong>${eleve.prenom} ${eleve.nom}</strong> a été créé.`;
+    credentialsText = [
+      `Identifiant (matricule) : ${studentMatricule || eleve.matricule}`,
+      `Mot de passe : ${password}`,
+      `Connexion : ${getLoginUrlForRole('ELEVE')}`,
+    ];
+    credentialsHtml = buildCredentialsBlock({
+      loginLabel: 'Matricule',
+      loginValue: studentMatricule || eleve.matricule,
+      password,
+      loginUrl: getLoginUrlForRole('ELEVE'),
+    });
+  } else {
+    const roleDetail = role === 'DIRECTEUR' && perimetre ? ` — cycle ${perimetre}` : '';
+    subject = `[${schoolName}] Vos identifiants ${roleLabel}${roleDetail} — EduManage`;
+    intro = `Votre compte <strong>${roleLabel}${roleDetail}</strong> a été créé sur la plateforme EduManage.`;
+    credentialsText = [
+      `E-mail : ${email}`,
+      `Mot de passe : ${password}`,
+      `Connexion : ${loginUrl}`,
+    ];
+    credentialsHtml = buildCredentialsBlock({
+      loginLabel: 'E-mail',
+      loginValue: email,
+      password,
+      loginUrl,
+    });
+  }
+
+  const text = [
+    `Bonjour ${greetingName},`,
+    '',
+    intro.replace(/<[^>]+>/g, ''),
+    '',
+    '── Informations de connexion ──',
+    ...credentialsText,
+    '',
+    'Conseil : modifiez votre mot de passe après la première connexion (menu « Mon profil »).',
+    '',
+    settings?.telephone ? `Secrétariat : ${settings.telephone}` : null,
+    settings?.email_contact ? `Contact école : ${settings.email_contact}` : null,
+    '',
+    'Cordialement,',
+    `L'administration — ${schoolName}`,
+  ].filter(Boolean).join('\n');
+
+  const html = wrapAccountEmailHtml({
+    schoolName,
+    title: subject.replace(`[${schoolName}] `, ''),
+    bodyHtml: `
+      <p>Bonjour <strong>${nom || greetingName}</strong>,</p>
+      <p>${intro}</p>
+      ${credentialsHtml}
+      <p style="font-size:13px;color:#64748b;margin-top:20px;">
+        Pensez à modifier votre mot de passe après votre première connexion.
+      </p>`,
+  });
+
+  return { subject, text, html };
+}
+
+async function sendAccountWelcomeEmail(prisma, options) {
+  const { email, password, linkedOnly } = options;
+  const recipient = (email || '').trim().toLowerCase();
+
+  if (!isDeliverableEmail(recipient)) {
+    return { ok: false, skipped: true, error: 'Adresse e-mail non exploitable ou interne.' };
+  }
+  if (!linkedOnly && !password) {
+    return { ok: false, error: 'Mot de passe manquant pour l\'e-mail de bienvenue.' };
+  }
+
+  const settings = await prisma.parametreSite.findUnique({ where: { id: 1 } });
+  const { subject, text, html } = buildAccountWelcomeContent({ settings, ...options, email: recipient });
+
+  return sendEmail(prisma, { to: recipient, subject, text, html });
+}
+
+function emailResponseMeta(result) {
+  if (!result) return {};
+  if (result.skipped) {
+    return { emailSent: false, emailSkipped: true, emailError: result.error };
+  }
+  return {
+    emailSent: Boolean(result.ok),
+    emailError: result.ok ? undefined : result.error,
+  };
+}
+
 function buildProfessorWelcomeContent({ settings, professeur, email, password }) {
   const schoolName = settings?.nom_ecole || 'GSP Elhadj Mamadou Saïdou Diallo';
-  const loginUrl = getAppLoginUrl();
+  const loginUrl = getLoginUrlForRole('PROFESSEUR');
   const fullName = `${professeur.prenom} ${professeur.nom}`.trim();
   const matieres = professeur.matieres || [];
   const matieresLines = matieres.length
@@ -221,8 +410,8 @@ function buildProfessorWelcomeContent({ settings, professeur, email, password })
 }
 
 async function sendProfessorWelcomeEmail(prisma, { professeur, email, password }) {
-  if (!email?.trim()) {
-    return { ok: false, error: 'E-mail du professeur manquant.' };
+  if (!isDeliverableEmail(email)) {
+    return { ok: false, skipped: true, error: 'E-mail du professeur manquant ou non exploitable.' };
   }
   if (!password) {
     return { ok: false, error: 'Mot de passe manquant pour l\'e-mail de bienvenue.' };
@@ -253,5 +442,9 @@ module.exports = {
   sendContactEmail,
   sendTestEmail,
   sendProfessorWelcomeEmail,
+  sendAccountWelcomeEmail,
+  emailResponseMeta,
+  isDeliverableEmail,
   getAppLoginUrl,
+  getLoginUrlForRole,
 };

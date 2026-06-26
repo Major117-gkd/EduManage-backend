@@ -18,12 +18,29 @@ model Utilisateur {
   nom          String
   email        String   @unique
   mot_de_passe String
-  role         String   // ADMIN, PROFESSEUR, PARENT
+  role         String   // ADMIN, COMPTABLE, DIRECTEUR, PROFESSEUR, ELEVE, PARENT
+  perimetre    String?  // Primaire, Collège, Lycée — pour DIRECTEUR
   photoUrl     String?  @db.Text
+  eleveId      Int?     @unique
   createdAt    DateTime @default(now())
 
-  professeur   Professeur?
-  notifications Notification[]
+  professeur     Professeur?
+  eleve          Eleve?             @relation(fields: [eleveId], references: [id], onDelete: SetNull)
+  parentEnfants  ParentEleveLink[]
+  notifications  Notification[]
+}
+
+model ParentEleveLink {
+  id            Int         @id @default(autoincrement())
+  utilisateurId Int
+  eleveId       Int
+  createdAt     DateTime    @default(now())
+
+  utilisateur   Utilisateur @relation(fields: [utilisateurId], references: [id], onDelete: Cascade)
+  eleve         Eleve       @relation(fields: [eleveId], references: [id], onDelete: Cascade)
+
+  @@unique([utilisateurId, eleveId])
+  @@index([eleveId])
 }
 
 model Eleve {
@@ -50,6 +67,8 @@ model Eleve {
   date_abandon    DateTime?
   motif_abandon   String?
   createdAt       DateTime      @default(now())
+  utilisateur     Utilisateur?
+  parentLiens     ParentEleveLink[]
 }
 
 model Professeur {
@@ -123,6 +142,7 @@ model Inscription {
   classeId       Int
   annee_scolaire String   // ex: 2023-2024
   statut         String   // En attente, Validé, Rejeté
+  motif_rejet    String?
   date_demande   DateTime @default(now())
 
   eleve          Eleve    @relation(fields: [eleveId], references: [id])
@@ -130,16 +150,19 @@ model Inscription {
 }
 
 model Matiere {
-  id           Int         @id @default(autoincrement())
-  nom          String
-  coefficient  Float       @default(1)
-  professeurId Int?
-  classeId     Int?
-  notes        Note[]
-  presences    PresenceProfesseur[]
+  id               Int         @id @default(autoincrement())
+  nom              String
+  coefficient      Float       @default(1)
+  professeurId     Int?
+  classeId         Int?
+  catalogMatiereId Int?
+  notes            Note[]
+  presences        PresenceProfesseur[]
 
-  professeur   Professeur?  @relation(fields: [professeurId], references: [id])
-  classe       Classe?     @relation(fields: [classeId], references: [id])
+  professeur       Professeur?  @relation(fields: [professeurId], references: [id])
+  classe           Classe?      @relation(fields: [classeId], references: [id])
+  catalogMatiere   Matiere?     @relation("MatiereInstances", fields: [catalogMatiereId], references: [id], onDelete: SetNull)
+  instances        Matiere[]    @relation("MatiereInstances")
 }
 
 model TarifHoraireClasse {
@@ -254,4 +277,18 @@ model Notification {
 
   @@index([utilisateurId, lu])
   @@index([utilisateurId, createdAt])
+}
+
+model Annonce {
+  id        Int      @id @default(autoincrement())
+  titre     String
+  contenu   String   @db.Text
+  categorie String   @default("Info")
+  publiee   Boolean  @default(false)
+  epinglee  Boolean  @default(false)
+  auteurNom String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([publiee, epinglee, createdAt])
 }

@@ -19,12 +19,15 @@ const {
   buildFormulaText,
   DEFAULT_NIVEAUX,
 } = require('./gradeRules');
-const { GRADE_TYPES, createGradeSaveNotifications } = require('./notificationService');
+const { GRADE_TYPES, createGradeSaveNotifications, createInscriptionNotifications, createPaymentNotifications } = require('./notificationService');
 const {
   sanitizeSettingsForClient,
   sendContactEmail,
   sendTestEmail,
   sendProfessorWelcomeEmail,
+  sendAccountWelcomeEmail,
+  emailResponseMeta,
+  isDeliverableEmail,
 } = require('./emailService');
 const {
   parsePresenceDate,
@@ -36,6 +39,37 @@ const {
   computeProfMonthlySummary,
   buildProfesseursAffectations,
 } = require('./teacherPayService');
+const {
+  isStaffRole,
+  canAccessAdminRoute,
+  permissionForPaymentsRoute,
+  hasPermission,
+  filterElevesByDirecteurCycle,
+  filterClassesByDirecteurCycle,
+  filterNiveauxByDirecteurCycle,
+  filterMatieresByDirecteurCycle,
+  filterProfesseursByDirecteurCycle,
+  getDirecteurPerimetre,
+  inscriptionWhereWithDirecteur,
+  cyclesForAuthUser,
+  DIRECTEUR_CYCLES,
+} = require('./rbac');
+const {
+  loadStudentProfile,
+  buildStudentGrades,
+  buildStudentBulletin,
+  buildStudentFilterOptions,
+  buildStudentPaymentSummary,
+  buildPaymentReceiptContext,
+} = require('./studentPortalService');
+const { buildStudentQrPayload, verifyStudentQrLogin } = require('./studentQrService');
+const {
+  createAdminAnnoncesRouter,
+  createPublicAnnoncesRouter,
+  createAuthAnnoncesRouter,
+} = require('./routes/annoncesRoutes');
+const { createParentRouter } = require('./routes/parentRoutes');
+const { linkParentToEleve } = require('./parentPortalService');
 
 const prisma = new PrismaClient();
 const app = express();
@@ -148,7 +182,7 @@ const isStudentUpToDate = async (eleveId, annee_scolaire, extraPayment = 0) => {
     if (!inscription) return false;
 
     const annualAmount = inscription.classe.montant_annuel || 0;
-    if (annualAmount === 0) return true; // No fees configured
+    if (annualAmount === 0) return false;
 
     const totalPaidYear = eleve.paiements.reduce((sum, p) => sum + p.montant, 0) + extraPayment;
     if (totalPaidYear >= annualAmount) return true;
@@ -192,7 +226,7 @@ const checkPaymentStatus = async (req, res, next) => {
     if (authHeader) {
       const token = authHeader.split(' ')[1];
       const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
-      if (decoded.role === 'ADMIN' || decoded.role === 'PROFESSEUR') {
+      if (decoded.role === 'ADMIN' || decoded.role === 'PROFESSEUR' || decoded.role === 'ELEVE' || decoded.role === 'PARENT') {
         return next();
       }
     }
@@ -267,6 +301,124 @@ async function requireAdmin(req, res, next) {
   next();
 }
 
+async function loadAuthUser(req) {
+  const decoded = getUserFromToken(req);
+  if (!decoded) return null;
+  const row = await prisma.utilisateur.findUnique({
+    where: { id: decoded.id },
+    select: { id: true, nom: true, email: true, role: true, perimetre: true, photoUrl: true, eleveId: true },
+  });
+  if (!row) return null;
+  return { ...decoded, ...row };
+}
+
+async function requireStaff(req, res, next) {
+  const user = await loadAuthUser(req);
+  if (!user || !isStaffRole(user.role)) {
+    return res.status(403).json({ error: 'Accès réservé au personnel de l\'établissement.' });
+  }
+  req.authUser = user;
+  next();
+}
+
+function adminPermissionGuard(req, res, next) {
+  if (req.authUser.role === 'ADMIN') return next();
+  const adminPath = req.path || '/';
+  if (!canAccessAdminRoute(req.authUser.role, req.method, adminPath)) {
+    return res.status(403).json({
+      error: 'Permission insuffisante pour cette action.',
+      role: req.authUser.role,
+    });
+  }
+  next();
+}
+
+function paymentsPermissionGuard(req, res, next) {
+  const perm = permissionForPaymentsRoute(req.method);
+  if (!hasPermission(req.authUser.role, perm)) {
+    return res.status(403).json({ error: 'Accès réservé au service financier.' });
+  }
+  next();
+}
+
+async function assertDirecteurClasseAccess(req, res, classeId) {
+  const perimetre = getDirecteurPerimetre(req.authUser);
+  if (!perimetre) return true;
+  const classe = await prisma.classe.findUnique({ where: { id: classeId } });
+  if (!classe || classe.cycle !== perimetre) {
+    res.status(403).json({ error: `Cette classe est hors de votre périmètre (${perimetre}).` });
+    return false;
+  }
+  return true;
+}
+
+async function assertDirecteurMatieresScope(req, res, matieresIds) {
+  const perimetre = getDirecteurPerimetre(req.authUser);
+  if (!perimetre || !matieresIds?.length) return true;
+  const ids = matieresIds.map((id) => parseInt(id, 10)).filter(Number.isFinite);
+  if (!ids.length) return true;
+  const matieres = await prisma.matiere.findMany({
+    where: { id: { in: ids } },
+    include: { classe: true },
+  });
+  if (matieres.length !== ids.length) {
+    res.status(400).json({ error: 'Une ou plusieurs matières sont introuvables.' });
+    return false;
+  }
+  const invalid = matieres.some((m) => m.classeId && m.classe?.cycle !== perimetre);
+  if (invalid) {
+    res.status(403).json({ error: `Certaines matières sont hors de votre périmètre (${perimetre}).` });
+    return false;
+  }
+  return true;
+}
+
+function rejectDirecteurDelete(req, res) {
+  if (req.authUser?.role === 'DIRECTEUR') {
+    res.status(403).json({ error: 'Suppression réservée à l\'administrateur.' });
+    return true;
+  }
+  return false;
+}
+
+function buildInscriptionWhere(authUser, baseWhere = {}) {
+  const perimetre = getDirecteurPerimetre(authUser);
+  return inscriptionWhereWithDirecteur(perimetre, baseWhere);
+}
+
+async function syncProfesseurMatieresForUser(tx, professeurId, matieresIds, authUser) {
+  const perimetre = getDirecteurPerimetre(authUser);
+  if (!Array.isArray(matieresIds)) return;
+
+  if (perimetre) {
+    const inCycle = await tx.matiere.findMany({
+      where: { professeurId, classe: { cycle: perimetre } },
+      select: { id: true },
+    });
+    if (inCycle.length) {
+      await tx.matiere.updateMany({
+        where: { id: { in: inCycle.map((m) => m.id) } },
+        data: { professeurId: null },
+      });
+    }
+  } else {
+    await tx.matiere.updateMany({
+      where: { professeurId },
+      data: { professeurId: null },
+    });
+  }
+
+  if (matieresIds.length > 0) {
+    const ids = matieresIds.map((id) => parseInt(id, 10)).filter((id) => !Number.isNaN(id));
+    if (ids.length) {
+      await tx.matiere.updateMany({
+        where: { id: { in: ids } },
+        data: { professeurId },
+      });
+    }
+  }
+}
+
 function resolveUserPhotoUrl(user, professeur) {
   return user?.photoUrl || professeur?.photoUrl || null;
 }
@@ -274,6 +426,73 @@ function resolveUserPhotoUrl(user, professeur) {
 function withUserPhoto(user, professeur) {
   if (!user) return user;
   return { ...user, photoUrl: resolveUserPhotoUrl(user, professeur) };
+}
+
+function buildStudentInternalEmail(matricule) {
+  const slug = (matricule || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  return `eleve.${slug || 'inconnu'}@gsp.local`;
+}
+
+async function findEleveByIdentifiant(identifiant) {
+  const raw = identifiant?.trim();
+  if (!raw) return null;
+  return prisma.eleve.findFirst({
+    where: { matricule: { equals: raw, mode: 'insensitive' } },
+    include: { utilisateur: true },
+  });
+}
+
+async function issueAuthToken(user, extras = {}) {
+  const token = jwt.sign(
+    { id: user.id, email: user.email, role: user.role, perimetre: user.perimetre || null },
+    process.env.JWT_SECRET || 'secret',
+    { expiresIn: '24h' }
+  );
+
+  let professeur = null;
+  let eleve = null;
+  if (user.role === 'PROFESSEUR') {
+    professeur = await prisma.professeur.findFirst({
+      where: { utilisateurId: user.id },
+      select: { photoUrl: true },
+    });
+  }
+  if (user.role === 'ELEVE' && user.eleveId) {
+    eleve = await prisma.eleve.findUnique({
+      where: { id: user.eleveId },
+      select: { id: true, nom: true, prenom: true, matricule: true, photoUrl: true },
+    });
+  }
+
+  let enfants = null;
+  if (user.role === 'PARENT') {
+    const links = await prisma.parentEleveLink.findMany({
+      where: { utilisateurId: user.id },
+      include: {
+        eleve: {
+          select: { id: true, nom: true, prenom: true, matricule: true, photoUrl: true },
+        },
+      },
+      orderBy: { id: 'asc' },
+    });
+    enfants = links.map((l) => l.eleve);
+  }
+
+  const userRow = await prisma.utilisateur.findUnique({
+    where: { id: user.id },
+    select: { id: true, nom: true, email: true, role: true, perimetre: true, photoUrl: true, eleveId: true },
+  });
+
+  return {
+    message: 'Connexion réussie',
+    token,
+    user: {
+      ...withUserPhoto(userRow, professeur),
+      eleve,
+      enfants,
+      identifiant: eleve?.matricule || extras.identifiant || null,
+    },
+  };
 }
 
 function formatProfesseurForClient(prof) {
@@ -375,9 +594,35 @@ app.get('/api/public/stats', async (req, res) => {
   }
 });
 
+// Liste publique des professeurs (page d'accueil — sans authentification)
+app.get('/api/public/professeurs', async (req, res) => {
+  try {
+    const profs = await prisma.professeur.findMany({
+      orderBy: { nom: 'asc' },
+      select: {
+        id: true,
+        prenom: true,
+        nom: true,
+        specialite: true,
+        contact: true,
+        photoUrl: true,
+        utilisateur: { select: { photoUrl: true } },
+      },
+    });
+    res.json(profs.map((prof) => ({
+      ...prof,
+      photoUrl: resolveUserPhotoUrl(prof.utilisateur, prof),
+    })));
+  } catch (error) {
+    console.error('Erreur GET /api/public/professeurs:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
 // Professeurs : accès limité à /api/teacher/* et /api/me uniquement
-app.use('/api/admin', requireAdmin);
-app.use('/api/paiements', requireAdmin);
+// Personnel : ADMIN, COMPTABLE, DIRECTEUR — permissions par route
+app.use('/api/admin', requireStaff, adminPermissionGuard);
+app.use('/api/paiements', requireStaff, paymentsPermissionGuard);
 
 // --- ROUTES ---
 
@@ -391,17 +636,79 @@ app.get('/api/admin/users', async (req, res) => {
     const users = await prisma.utilisateur.findMany({
       orderBy: { createdAt: 'desc' },
       select: {
-        id: true, nom: true, email: true, role: true, createdAt: true, photoUrl: true,
-        professeur: { select: { id: true, specialite: true, contact: true, photoUrl: true } }
+        id: true, nom: true, email: true, role: true, perimetre: true, createdAt: true, photoUrl: true, eleveId: true,
+        professeur: { select: { id: true, specialite: true, contact: true, photoUrl: true } },
+        eleve: { select: { id: true, nom: true, prenom: true, matricule: true } },
+        parentEnfants: {
+          include: {
+            eleve: { select: { id: true, nom: true, prenom: true, matricule: true } },
+          },
+        },
       }
     });
     const usersWithPhoto = users.map((u) => {
-      const { professeur, ...rest } = u;
-      return { ...rest, photoUrl: resolveUserPhotoUrl(rest, professeur), professeur };
+      const { professeur, parentEnfants, ...rest } = u;
+      return {
+        ...rest,
+        photoUrl: resolveUserPhotoUrl(rest, professeur),
+        professeur,
+        enfants: parentEnfants?.map((l) => l.eleve) || [],
+      };
     });
     res.json(usersWithPhoto);
   } catch (error) {
     console.error('Erreur liste utilisateurs:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// Create a user (admin accounts)
+app.post('/api/admin/users', async (req, res) => {
+  const { nom, email, role, mot_de_passe, perimetre } = req.body;
+  const allowedRoles = ['ADMIN', 'COMPTABLE', 'DIRECTEUR'];
+  if (!nom?.trim() || !email?.trim() || !mot_de_passe) {
+    return res.status(400).json({ error: 'Nom, e-mail et mot de passe requis.' });
+  }
+  if (!allowedRoles.includes(role)) {
+    return res.status(400).json({ error: 'Rôle invalide. Utilisez ADMIN, COMPTABLE ou DIRECTEUR.' });
+  }
+  if (role === 'DIRECTEUR') {
+    if (!perimetre || !DIRECTEUR_CYCLES.includes(perimetre)) {
+      return res.status(400).json({ error: 'Périmètre requis pour un directeur : Primaire, Collège ou Lycée.' });
+    }
+  }
+  if (mot_de_passe.length < 6) {
+    return res.status(400).json({ error: 'Le mot de passe doit avoir au moins 6 caractères.' });
+  }
+  try {
+    const hashed = await bcrypt.hash(mot_de_passe, 10);
+    const user = await prisma.utilisateur.create({
+      data: {
+        nom: nom.trim(),
+        email: email.trim().toLowerCase(),
+        mot_de_passe: hashed,
+        role,
+        ...(role === 'DIRECTEUR' ? { perimetre } : { perimetre: null }),
+      },
+      select: { id: true, nom: true, email: true, role: true, perimetre: true, createdAt: true, photoUrl: true },
+    });
+
+    const emailResult = await sendAccountWelcomeEmail(prisma, {
+      role: user.role,
+      nom: user.nom,
+      email: user.email,
+      password: mot_de_passe,
+      perimetre: user.perimetre,
+    });
+
+    res.status(201).json({
+      message: 'Utilisateur créé.',
+      user,
+      ...emailResponseMeta(emailResult),
+    });
+  } catch (error) {
+    console.error('Erreur création utilisateur:', error);
+    if (error.code === 'P2002') return res.status(409).json({ error: 'Cet e-mail est déjà utilisé.' });
     res.status(500).json({ error: 'Erreur interne.' });
   }
 });
@@ -465,7 +772,7 @@ app.delete('/api/admin/users/:id', async (req, res) => {
 });
 
 
-// Route de connexion
+// Route de connexion (admin, professeur — par e-mail)
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
 
@@ -474,50 +781,91 @@ app.post('/api/login', async (req, res) => {
   }
 
   try {
-    // 1. Chercher l'utilisateur par e-mail
     const user = await prisma.utilisateur.findUnique({
-      where: { email },
+      where: { email: email.trim().toLowerCase() },
     });
 
     if (!user) {
       return res.status(401).json({ error: 'Identifiants incorrects.' });
     }
 
-    // 2. Vérifier le mot de passe
+    if (user.role === 'ELEVE') {
+      return res.status(403).json({
+        error: 'Les élèves se connectent avec leur identifiant (carte scolaire) sur la page Espace élève.',
+        redirect: '/login/eleve',
+      });
+    }
+
     const isPasswordValid = await bcrypt.compare(password, user.mot_de_passe);
-    
     if (!isPasswordValid) {
       return res.status(401).json({ error: 'Identifiants incorrects.' });
     }
 
-    // 3. Générer le JWT
-    const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role },
-      process.env.JWT_SECRET || 'secret',
-      { expiresIn: '24h' }
-    );
-
-    // 4. Renvoyer le token et les infos
-    let professeur = null;
-    if (user.role === 'PROFESSEUR') {
-      professeur = await prisma.professeur.findFirst({
-        where: { utilisateurId: user.id },
-        select: { photoUrl: true },
-      });
-    }
-    const userRow = await prisma.utilisateur.findUnique({
-      where: { id: user.id },
-      select: { id: true, nom: true, email: true, role: true, photoUrl: true },
-    });
-
-    res.json({
-      message: 'Connexion réussie',
-      token,
-      user: withUserPhoto(userRow, professeur),
-    });
-
+    const payload = await issueAuthToken(user);
+    res.json(payload);
   } catch (error) {
-    console.error("Erreur login:", error);
+    console.error('Erreur login:', error);
+    res.status(500).json({ error: 'Erreur interne du serveur.' });
+  }
+});
+
+// Connexion élève par identifiant (matricule sur la carte)
+app.post('/api/login/eleve', async (req, res) => {
+  const { identifiant, password } = req.body;
+
+  if (!identifiant?.trim() || !password) {
+    return res.status(400).json({ error: 'Identifiant et mot de passe requis.' });
+  }
+
+  try {
+    const eleve = await findEleveByIdentifiant(identifiant);
+    if (!eleve?.utilisateur) {
+      return res.status(401).json({ error: 'Identifiant ou mot de passe incorrect.' });
+    }
+
+    const user = eleve.utilisateur;
+    if (user.role !== 'ELEVE') {
+      return res.status(401).json({ error: 'Identifiant ou mot de passe incorrect.' });
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, user.mot_de_passe);
+    if (!isPasswordValid) {
+      return res.status(401).json({ error: 'Identifiant ou mot de passe incorrect.' });
+    }
+
+    const payload = await issueAuthToken(
+      { ...user, eleveId: eleve.id },
+      { identifiant: eleve.matricule }
+    );
+    res.json(payload);
+  } catch (error) {
+    console.error('Erreur login élève:', error);
+    res.status(500).json({ error: 'Erreur interne du serveur.' });
+  }
+});
+
+// Connexion élève par scan QR (carte scolaire — sans mot de passe)
+app.post('/api/login/eleve/qr', async (req, res) => {
+  const { qrData } = req.body;
+
+  if (!qrData?.trim()) {
+    return res.status(400).json({ error: 'Code QR requis.' });
+  }
+
+  try {
+    const result = await verifyStudentQrLogin(prisma, findEleveByIdentifiant, qrData);
+    if (result.error) {
+      return res.status(result.status || 400).json({ error: result.error });
+    }
+
+    const { eleve, user } = result;
+    const payload = await issueAuthToken(
+      { ...user, eleveId: eleve.id },
+      { identifiant: eleve.matricule }
+    );
+    res.json(payload);
+  } catch (error) {
+    console.error('Erreur login élève QR:', error);
     res.status(500).json({ error: 'Erreur interne du serveur.' });
   }
 });
@@ -732,6 +1080,14 @@ app.patch('/api/notifications/read-all', requireAuth, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════
+//  ANNONCES (communication publique + admin)
+// ══════════════════════════════════════════════
+
+app.use('/api/admin/annonces', createAdminAnnoncesRouter(prisma));
+app.use('/api/public/annonces', createPublicAnnoncesRouter(prisma));
+app.use('/api/annonces', requireAuth, createAuthAnnoncesRouter(prisma));
+
 app.get('/api/admin/site-settings', async (req, res) => {
   try {
     const settings = await getOrCreateSiteSettings();
@@ -879,13 +1235,17 @@ const professeurMatieresInclude = {
 
 app.get('/api/admin/professeurs', async (req, res) => {
   try {
-    const profs = await prisma.professeur.findMany({
+    let profs = await prisma.professeur.findMany({
       orderBy: { nom: 'asc' },
       include: {
         utilisateur: { select: { id: true, email: true, nom: true, role: true, createdAt: true, photoUrl: true } },
         ...professeurMatieresInclude,
       },
     });
+    const perimetre = getDirecteurPerimetre(req.authUser);
+    if (perimetre) {
+      profs = filterProfesseursByDirecteurCycle(profs, perimetre);
+    }
     res.json(profs.map(formatProfesseurForClient));
   } catch (error) {
     res.status(500).json({ error: 'Erreur interne.' });
@@ -951,10 +1311,17 @@ app.get('/api/admin/eleves', async (req, res) => {
           include: { classe: true },
           orderBy: { date_demande: 'desc' },
         },
+        utilisateur: { select: { id: true, email: true, nom: true } },
+        parentLiens: {
+          include: {
+            utilisateur: { select: { id: true, email: true, nom: true, role: true } },
+          },
+        },
       },
     });
 
     const classeId = classe_id ? parseInt(classe_id, 10) : null;
+    if (classeId && !(await assertDirecteurClasseAccess(req, res, classeId))) return;
 
     eleves = eleves.filter((eleve) => {
       const inscriptions = eleve.inscriptions || [];
@@ -990,9 +1357,44 @@ app.get('/api/admin/eleves', async (req, res) => {
       return true;
     });
 
+    if (req.authUser?.role === 'DIRECTEUR' && req.authUser.perimetre) {
+      eleves = filterElevesByDirecteurCycle(eleves, req.authUser.perimetre);
+    }
+
     res.json(eleves);
   } catch (error) {
     console.error('Erreur GET eleves:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// Payload QR connexion pour carte scolaire
+app.get('/api/admin/eleves/:id/qr-login', async (req, res) => {
+  const eleveId = parseInt(req.params.id, 10);
+  if (!Number.isFinite(eleveId)) {
+    return res.status(400).json({ error: 'Identifiant élève invalide.' });
+  }
+
+  try {
+    const eleve = await prisma.eleve.findUnique({
+      where: { id: eleveId },
+      include: {
+        inscriptions: { include: { classe: true }, orderBy: { date_demande: 'desc' } },
+      },
+    });
+
+    if (!eleve) return res.status(404).json({ error: 'Élève introuvable.' });
+
+    if (req.authUser?.role === 'DIRECTEUR' && req.authUser.perimetre) {
+      const inCycle = (eleve.inscriptions || []).some((ins) => ins.classe?.cycle === req.authUser.perimetre);
+      if (!inCycle) {
+        return res.status(403).json({ error: 'Élève hors de votre périmètre.' });
+      }
+    }
+
+    res.json({ qrData: buildStudentQrPayload(eleve.id, eleve.matricule) });
+  } catch (error) {
+    console.error('Erreur QR login élève:', error);
     res.status(500).json({ error: 'Erreur interne.' });
   }
 });
@@ -1022,7 +1424,7 @@ app.post('/api/admin/eleves', async (req, res) => {
           exception_paiement_mensuel: exception_paiement_mensuel || false
         }
       });
-      await tx.inscription.create({
+      const inscription = await tx.inscription.create({
         data: {
           eleveId: newEleve.id,
           classeId: parseInt(classeId),
@@ -1030,10 +1432,18 @@ app.post('/api/admin/eleves', async (req, res) => {
           statut: 'En attente'
         }
       });
-      return newEleve;
+      return { newEleve, inscription };
     });
 
-    res.json({ message: 'Élève inscrit avec succès', eleve });
+    const classe = await prisma.classe.findUnique({ where: { id: parseInt(classeId) } });
+    await createInscriptionNotifications(prisma, {
+      event: 'nouvelle',
+      eleve: eleve.newEleve,
+      inscription: eleve.inscription,
+      classe,
+    }).catch((err) => console.error('Notif inscription:', err));
+
+    res.json({ message: 'Élève inscrit avec succès', eleve: eleve.newEleve });
   } catch (error) {
     console.error('Erreur création élève:', error);
     res.status(500).json({ error: 'Erreur interne.' });
@@ -1080,6 +1490,146 @@ app.put('/api/admin/eleves/:id', async (req, res) => {
     res.json({ message: 'Élève mis à jour avec succès', eleve });
   } catch (error) {
     console.error('Erreur mise à jour élève:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// Créer ou lier un compte espace élève
+app.post('/api/admin/eleves/:id/compte', async (req, res) => {
+  const eleveId = parseInt(req.params.id, 10);
+  const { mot_de_passe, nom } = req.body;
+
+  if (!mot_de_passe || mot_de_passe.length < 6) {
+    return res.status(400).json({ error: 'Mot de passe initial requis (6 caractères min.).' });
+  }
+
+  try {
+    const eleve = await prisma.eleve.findUnique({
+      where: { id: eleveId },
+      include: { utilisateur: { select: { id: true, email: true } } },
+    });
+    if (!eleve) return res.status(404).json({ error: 'Élève introuvable.' });
+    if (eleve.utilisateur) {
+      return res.status(409).json({
+        error: 'Un compte existe déjà pour cet élève.',
+        identifiant: eleve.matricule,
+      });
+    }
+
+    const email = buildStudentInternalEmail(eleve.matricule);
+    const hashed = await bcrypt.hash(mot_de_passe, 10);
+    const account = await prisma.utilisateur.create({
+      data: {
+        nom: nom?.trim() || `${eleve.prenom} ${eleve.nom}`,
+        email,
+        mot_de_passe: hashed,
+        role: 'ELEVE',
+        eleveId,
+        photoUrl: eleve.photoUrl || null,
+      },
+      select: { id: true, email: true, nom: true, role: true, eleveId: true },
+    });
+
+    let emailResult = { skipped: true, error: 'Aucun e-mail parent renseigné sur la fiche élève.' };
+    if (isDeliverableEmail(eleve.parent_email)) {
+      emailResult = await sendAccountWelcomeEmail(prisma, {
+        role: 'ELEVE',
+        nom: eleve.parent_nom || `${eleve.prenom} ${eleve.nom}`,
+        email: eleve.parent_email,
+        password: mot_de_passe,
+        eleve: { prenom: eleve.prenom, nom: eleve.nom, matricule: eleve.matricule },
+        studentMatricule: eleve.matricule,
+      });
+    }
+
+    res.status(201).json({
+      message: 'Compte élève créé avec succès.',
+      identifiant: eleve.matricule,
+      compte: { ...account, identifiant: eleve.matricule },
+      ...emailResponseMeta(emailResult),
+    });
+  } catch (error) {
+    console.error('Erreur création compte élève:', error);
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: 'Un compte existe déjà pour cet élève.' });
+    }
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// Créer un compte espace parent lié à un élève
+app.post('/api/admin/eleves/:id/compte-parent', async (req, res) => {
+  const eleveId = parseInt(req.params.id, 10);
+  const { mot_de_passe, email, nom } = req.body;
+
+  if (!mot_de_passe || mot_de_passe.length < 6) {
+    return res.status(400).json({ error: 'Mot de passe initial requis (6 caractères min.).' });
+  }
+
+  try {
+    const eleve = await prisma.eleve.findUnique({ where: { id: eleveId } });
+    if (!eleve) return res.status(404).json({ error: 'Élève introuvable.' });
+
+    const emailToUse = (email || eleve.parent_email || '').trim().toLowerCase();
+    if (!emailToUse) {
+      return res.status(400).json({ error: 'E-mail parent requis (renseignez-le sur la fiche élève ou dans le formulaire).' });
+    }
+
+    let user = await prisma.utilisateur.findUnique({ where: { email: emailToUse } });
+    let isNewParent = false;
+
+    if (user) {
+      if (user.role !== 'PARENT') {
+        return res.status(409).json({ error: 'Cet e-mail est déjà utilisé par un autre type de compte.' });
+      }
+    } else {
+      isNewParent = true;
+      const hashed = await bcrypt.hash(mot_de_passe, 10);
+      user = await prisma.utilisateur.create({
+        data: {
+          nom: nom?.trim() || eleve.parent_nom || `Parent de ${eleve.prenom} ${eleve.nom}`,
+          email: emailToUse,
+          mot_de_passe: hashed,
+          role: 'PARENT',
+        },
+      });
+    }
+
+    const existingLink = await prisma.parentEleveLink.findUnique({
+      where: { utilisateurId_eleveId: { utilisateurId: user.id, eleveId } },
+    });
+    if (existingLink) {
+      return res.status(409).json({
+        error: 'Un compte parent est déjà lié à cet élève avec cet e-mail.',
+        email: user.email,
+      });
+    }
+
+    await linkParentToEleve(prisma, { utilisateurId: user.id, eleveId });
+
+    const emailResult = await sendAccountWelcomeEmail(prisma, {
+      role: 'PARENT',
+      nom: user.nom,
+      email: user.email,
+      password: isNewParent ? mot_de_passe : undefined,
+      linkedOnly: !isNewParent,
+      eleve: { prenom: eleve.prenom, nom: eleve.nom, matricule: eleve.matricule },
+    });
+
+    res.status(201).json({
+      message: isNewParent ? 'Compte parent créé et lié à l\'élève.' : 'Enfant lié au compte parent existant.',
+      compte: {
+        id: user.id,
+        nom: user.nom,
+        email: user.email,
+        role: user.role,
+      },
+      eleve: { id: eleve.id, nom: eleve.nom, prenom: eleve.prenom, matricule: eleve.matricule },
+      ...emailResponseMeta(emailResult),
+    });
+  } catch (error) {
+    console.error('Erreur création compte parent:', error);
+    if (error.code === 'P2002') return res.status(409).json({ error: 'Cet e-mail est déjà utilisé.' });
     res.status(500).json({ error: 'Erreur interne.' });
   }
 });
@@ -1192,11 +1742,235 @@ app.put('/api/admin/inscriptions/:id/valider', async (req, res) => {
   try {
     const inscription = await prisma.inscription.update({
       where: { id: inscriptionId },
-      data: { statut: 'Validé' }
+      data: { statut: 'Validé', motif_rejet: null },
+      include: {
+        eleve: true,
+        classe: true,
+      },
     });
+    await createInscriptionNotifications(prisma, {
+      event: 'validee',
+      eleve: inscription.eleve,
+      inscription,
+      classe: inscription.classe,
+    }).catch((err) => console.error('Notif validation:', err));
     res.json({ message: 'Inscription validée avec succès', inscription });
   } catch (error) {
     console.error('Erreur validation inscription:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// REJECT an Inscription
+app.put('/api/admin/inscriptions/:id/rejeter', async (req, res) => {
+  const inscriptionId = parseInt(req.params.id);
+  const { motif_rejet } = req.body;
+  if (!motif_rejet?.trim()) {
+    return res.status(400).json({ error: 'Le motif du rejet est requis.' });
+  }
+  try {
+    const inscription = await prisma.inscription.update({
+      where: { id: inscriptionId },
+      data: { statut: 'Rejeté', motif_rejet: motif_rejet.trim() },
+      include: {
+        eleve: true,
+        classe: true,
+      },
+    });
+    await createInscriptionNotifications(prisma, {
+      event: 'rejetee',
+      eleve: inscription.eleve,
+      inscription,
+      classe: inscription.classe,
+    }).catch((err) => console.error('Notif rejet:', err));
+    res.json({ message: 'Inscription rejetée', inscription });
+  } catch (error) {
+    console.error('Erreur rejet inscription:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// Recherche globale admin
+app.get('/api/admin/search', async (req, res) => {
+  const q = (req.query.q || '').trim();
+  if (q.length < 2) {
+    return res.json({ eleves: [], classes: [], professeurs: [] });
+  }
+  try {
+    const [eleves, classes, professeurs] = await Promise.all([
+      prisma.eleve.findMany({
+        where: {
+          OR: [
+            { nom: { contains: q, mode: 'insensitive' } },
+            { prenom: { contains: q, mode: 'insensitive' } },
+            { matricule: { contains: q, mode: 'insensitive' } },
+            { parent_nom: { contains: q, mode: 'insensitive' } },
+            { parent_telephone: { contains: q, mode: 'insensitive' } },
+          ],
+        },
+        take: 8,
+        select: {
+          id: true,
+          nom: true,
+          prenom: true,
+          matricule: true,
+          statut_financier: true,
+          inscriptions: {
+            take: 1,
+            orderBy: { date_demande: 'desc' },
+            include: { classe: { select: { nom: true } } },
+          },
+        },
+      }),
+      prisma.classe.findMany({
+        where: {
+          OR: [
+            { nom: { contains: q, mode: 'insensitive' } },
+            { niveau: { contains: q, mode: 'insensitive' } },
+            { cycle: { contains: q, mode: 'insensitive' } },
+          ],
+        },
+        take: 5,
+        select: { id: true, nom: true, niveau: true, cycle: true },
+      }),
+      prisma.professeur.findMany({
+        where: {
+          OR: [
+            { nom: { contains: q, mode: 'insensitive' } },
+            { prenom: { contains: q, mode: 'insensitive' } },
+            { specialite: { contains: q, mode: 'insensitive' } },
+          ],
+        },
+        take: 5,
+        select: { id: true, nom: true, prenom: true, specialite: true },
+      }),
+    ]);
+
+    res.json({
+      eleves: eleves.map((e) => ({
+        id: e.id,
+        label: `${e.prenom} ${e.nom}`,
+        sub: `${e.matricule} · ${e.inscriptions[0]?.classe?.nom || '—'}`,
+        path: `/admin/students?search=${encodeURIComponent(e.matricule)}`,
+        statut_financier: e.statut_financier,
+      })),
+      classes: classes.map((c) => ({
+        id: c.id,
+        label: c.nom,
+        sub: `${c.niveau} · ${c.cycle}`,
+        path: '/admin/classes',
+      })),
+      professeurs: professeurs.map((p) => ({
+        id: p.id,
+        label: `${p.prenom} ${p.nom}`,
+        sub: p.specialite || 'Professeur',
+        path: '/admin/teachers',
+      })),
+    });
+  } catch (error) {
+    console.error('Erreur recherche admin:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// Rapports financiers
+app.get('/api/admin/rapports/financiers', async (req, res) => {
+  const { mois, annee_scolaire } = req.query;
+  try {
+    const wherePaiements = {};
+    if (annee_scolaire) wherePaiements.annee_scolaire = annee_scolaire;
+    if (mois) {
+      const [year, month] = mois.split('-').map(Number);
+      if (year && month) {
+        const start = new Date(year, month - 1, 1);
+        const end = new Date(year, month, 0, 23, 59, 59, 999);
+        wherePaiements.date_paiement = { gte: start, lte: end };
+      }
+    }
+
+    const paiements = await prisma.paiement.findMany({
+      where: wherePaiements,
+      include: {
+        eleve: {
+          select: { id: true, nom: true, prenom: true, matricule: true },
+        },
+      },
+      orderBy: { date_paiement: 'desc' },
+    });
+
+    const parMode = {};
+    let totalEncaisse = 0;
+    paiements.forEach((p) => {
+      const mode = p.mode_paiement || 'Autre';
+      parMode[mode] = (parMode[mode] || 0) + p.montant;
+      totalEncaisse += p.montant;
+    });
+
+    const elevesEnRetard = await prisma.eleve.findMany({
+      where: {
+        statut: 'Actif',
+        statut_financier: { in: ['En retard', 'À jour partiel', 'En attente'] },
+      },
+      select: {
+        id: true,
+        nom: true,
+        prenom: true,
+        matricule: true,
+        solde: true,
+        statut_financier: true,
+        parent_nom: true,
+        parent_telephone: true,
+        inscriptions: {
+          where: { statut: 'Validé' },
+          orderBy: { date_demande: 'desc' },
+          take: 1,
+          include: { classe: { select: { nom: true, montant_annuel: true } } },
+        },
+        paiements: annee_scolaire
+          ? { where: { annee_scolaire }, select: { montant: true } }
+          : { select: { montant: true } },
+      },
+      orderBy: [{ statut_financier: 'asc' }, { nom: 'asc' }],
+    });
+
+    const retards = elevesEnRetard.map((e) => {
+      const ins = e.inscriptions[0];
+      const annual = ins?.classe?.montant_annuel || 0;
+      const paid = (e.paiements || []).reduce((s, p) => s + p.montant, 0);
+      return {
+        id: e.id,
+        nom: e.nom,
+        prenom: e.prenom,
+        matricule: e.matricule,
+        classe: ins?.classe?.nom || '—',
+        statut_financier: e.statut_financier,
+        solde: e.solde,
+        annualAmount: annual,
+        totalPaid: paid,
+        remaining: Math.max(0, annual - paid),
+        parent_nom: e.parent_nom,
+        parent_telephone: e.parent_telephone,
+      };
+    });
+
+    res.json({
+      periode: { mois: mois || null, annee_scolaire: annee_scolaire || null },
+      totalEncaisse,
+      nombrePaiements: paiements.length,
+      parMode: Object.entries(parMode).map(([mode, montant]) => ({ mode, montant })),
+      paiements: paiements.map((p) => ({
+        id: p.id,
+        date: p.date_paiement,
+        montant: p.montant,
+        mode_paiement: p.mode_paiement,
+        periode: p.periode,
+        reference: p.reference,
+        eleve: p.eleve,
+      })),
+      elevesEnRetard: retards,
+    });
+  } catch (error) {
+    console.error('Erreur rapport financier:', error);
     res.status(500).json({ error: 'Erreur interne.' });
   }
 });
@@ -1279,63 +2053,117 @@ async function resolveClasseNiveauFields(body) {
   };
 }
 
-function validateClasseMatieres(matieres) {
-  if (!matieres || !Array.isArray(matieres)) {
-    return { error: 'Au moins une matière est obligatoire pour une classe.' };
+function validateClasseMatieresIds(matieresIds) {
+  if (!matieresIds || !Array.isArray(matieresIds) || matieresIds.length === 0) {
+    return { error: 'Sélectionnez au moins une matière pour cette classe.' };
   }
-
-  const partial = matieres.filter((m) => {
-    const hasNom = Boolean(m.nom?.trim());
-    const hasProf = Boolean(m.professeurId);
-    return (hasNom && !hasProf) || (!hasNom && hasProf);
-  });
-  if (partial.length > 0) {
-    return { error: 'Chaque matière doit avoir un nom et un professeur assigné.' };
+  const catalogIds = [...new Set(
+    matieresIds.map((id) => parseInt(id, 10)).filter((id) => !Number.isNaN(id))
+  )];
+  if (catalogIds.length === 0) {
+    return { error: 'Sélectionnez au moins une matière valide.' };
   }
-
-  const valid = matieres
-    .map((m) => ({
-      id: m.id,
-      nom: m.nom?.trim(),
-      coefficient: parseFloat(m.coefficient) || 1,
-      professeurId: m.professeurId ? parseInt(m.professeurId, 10) : null,
-    }))
-    .filter((m) => m.nom);
-
-  if (valid.length === 0) {
-    return { error: 'Ajoutez au moins une matière avec un nom.' };
-  }
-
-  const sansProf = valid.filter((m) => !m.professeurId);
-  if (sansProf.length > 0) {
-    const noms = sansProf.map((m) => `« ${m.nom} »`).join(', ');
-    return { error: `Chaque matière doit avoir un professeur assigné : ${noms}.` };
-  }
-
-  return { matieres: valid };
+  return { catalogIds };
 }
 
-function validateMatierePayload(body) {
+async function syncClasseMatieresFromCatalog(tx, classeId, catalogIds) {
+  const catalogs = await tx.matiere.findMany({
+    where: {
+      id: { in: catalogIds },
+      classeId: null,
+      catalogMatiereId: null,
+    },
+  });
+
+  if (catalogs.length !== catalogIds.length) {
+    throw new Error('Une ou plusieurs matières sélectionnées sont introuvables dans le catalogue.');
+  }
+
+  const existing = await tx.matiere.findMany({ where: { classeId } });
+  const keepIds = new Set(catalogIds);
+
+  for (const ex of existing) {
+    if (!ex.catalogMatiereId) {
+      const match = catalogs.find((c) => c.nom === ex.nom);
+      if (match) {
+        if (keepIds.has(match.id)) {
+          await tx.matiere.update({
+            where: { id: ex.id },
+            data: { catalogMatiereId: match.id },
+          });
+          continue;
+        }
+      }
+      const noteCount = await tx.note.count({ where: { matiereId: ex.id } });
+      if (noteCount > 0) {
+        throw new Error(`Impossible de retirer « ${ex.nom} » : des notes existent déjà.`);
+      }
+      await tx.matiere.update({ where: { id: ex.id }, data: { professeurId: null } });
+      await tx.matiere.delete({ where: { id: ex.id } });
+      continue;
+    }
+
+    if (!keepIds.has(ex.catalogMatiereId)) {
+      const noteCount = await tx.note.count({ where: { matiereId: ex.id } });
+      if (noteCount > 0) {
+        throw new Error(`Impossible de retirer « ${ex.nom} » : des notes existent déjà.`);
+      }
+      await tx.matiere.update({
+        where: { id: ex.id },
+        data: { professeurId: null },
+      });
+      await tx.matiere.delete({ where: { id: ex.id } });
+    }
+  }
+
+  const refreshed = await tx.matiere.findMany({ where: { classeId } });
+  const existingCatalogIds = new Set(
+    refreshed.map((m) => m.catalogMatiereId).filter(Boolean)
+  );
+
+  for (const cat of catalogs) {
+    if (!existingCatalogIds.has(cat.id)) {
+      await tx.matiere.create({
+        data: {
+          nom: cat.nom,
+          coefficient: cat.coefficient,
+          classeId,
+          catalogMatiereId: cat.id,
+        },
+      });
+    }
+  }
+}
+
+function validateMatierePayload(body, { catalogOnly = false } = {}) {
   const { nom, coefficient, professeurId, classeId } = body;
 
-  if (!classeId) {
-    return { error: 'La classe est obligatoire pour affecter une matière.' };
-  }
   if (!nom?.trim()) {
     return { error: 'Le nom de la matière est requis.' };
   }
-  if (!professeurId) {
-    return { error: 'Un professeur doit être assigné à la matière.' };
+
+  if (catalogOnly || !classeId) {
+    return {
+      data: {
+        nom: nom.trim(),
+        coefficient: parseFloat(coefficient) || 1,
+        classeId: null,
+        catalogMatiereId: null,
+      },
+    };
   }
 
-  return {
-    data: {
-      nom: nom.trim(),
-      coefficient: parseFloat(coefficient) || 1,
-      professeurId: parseInt(professeurId, 10),
-      classeId: parseInt(classeId, 10),
-    },
+  const data = {
+    nom: nom.trim(),
+    coefficient: parseFloat(coefficient) || 1,
+    classeId: parseInt(classeId, 10),
   };
+
+  if (professeurId !== undefined && professeurId !== null && professeurId !== '') {
+    data.professeurId = parseInt(professeurId, 10);
+  }
+
+  return { data };
 }
 
 function serializeNiveau(niveau) {
@@ -1368,10 +2196,14 @@ app.get('/api/admin/niveaux', async (req, res) => {
   try {
     await ensureDefaultNiveaux();
     await linkClassesToNiveaux();
-    const niveaux = await prisma.niveauEtude.findMany({
+    let niveaux = await prisma.niveauEtude.findMany({
       orderBy: [{ cycle: 'asc' }, { ordre: 'asc' }, { nom: 'asc' }],
       include: { _count: { select: { classes: true } } },
     });
+    const perimetre = getDirecteurPerimetre(req.authUser);
+    if (perimetre) {
+      niveaux = filterNiveauxByDirecteurCycle(niveaux, perimetre);
+    }
     res.json(niveaux.map(serializeNiveau));
   } catch (error) {
     console.error('Erreur GET admin/niveaux:', error);
@@ -1474,7 +2306,11 @@ app.get('/api/admin/classes', async (req, res) => {
         },
       },
     });
-    res.json(classes);
+    let result = classes;
+    if (req.authUser?.role === 'DIRECTEUR' && req.authUser.perimetre) {
+      result = filterClassesByDirecteurCycle(classes, req.authUser.perimetre);
+    }
+    res.json(result);
   } catch (error) {
     console.error("Erreur récupération classes:", error);
     res.status(500).json({ error: 'Erreur interne.' });
@@ -1482,60 +2318,66 @@ app.get('/api/admin/classes', async (req, res) => {
 });
 
 app.post('/api/admin/classes', async (req, res) => {
-  const { nom, capacite, montant_annuel, anneeScolaireId, tranches, matieres } = req.body;
+  const { nom, capacite, montant_annuel, anneeScolaireId, tranches, matieresIds } = req.body;
   try {
-    const matieresCheck = validateClasseMatieres(matieres);
+    const matieresCheck = validateClasseMatieresIds(matieresIds);
     if (matieresCheck.error) {
       return res.status(400).json({ error: matieresCheck.error });
     }
 
     const niveauFields = await resolveClasseNiveauFields(req.body);
-    const newClass = await prisma.classe.create({
-      data: {
-        nom,
-        ...niveauFields,
-        capacite: parseInt(capacite) || 30,
-        montant_annuel: parseFloat(montant_annuel) || 0,
-        anneeScolaireId: anneeScolaireId ? parseInt(anneeScolaireId) : null,
-        tranches: {
-          create: tranches && Array.isArray(tranches) ? tranches.map(t => ({
-            nom: t.nom,
-            montant: parseFloat(t.montant) || 0,
-            date_limite: t.date_limite ? new Date(t.date_limite) : null
-          })) : []
+    const newClass = await prisma.$transaction(async (tx) => {
+      const created = await tx.classe.create({
+        data: {
+          nom,
+          ...niveauFields,
+          capacite: parseInt(capacite) || 30,
+          montant_annuel: parseFloat(montant_annuel) || 0,
+          anneeScolaireId: anneeScolaireId ? parseInt(anneeScolaireId) : null,
+          tranches: {
+            create: tranches && Array.isArray(tranches) ? tranches.map(t => ({
+              nom: t.nom,
+              montant: parseFloat(t.montant) || 0,
+              date_limite: t.date_limite ? new Date(t.date_limite) : null
+            })) : []
+          },
         },
-        matieres: {
-          create: matieresCheck.matieres.map((m) => ({
-            nom: m.nom,
-            coefficient: m.coefficient,
-            professeurId: m.professeurId,
-          })),
+      });
+
+      await syncClasseMatieresFromCatalog(tx, created.id, matieresCheck.catalogIds);
+
+      return tx.classe.findUnique({
+        where: { id: created.id },
+        include: {
+          tranches: true,
+          matieres: { include: { professeur: true, catalogMatiere: true }, orderBy: { nom: 'asc' } },
+          niveauEtude: true,
         },
-      },
-      include: { tranches: true, matieres: { include: { professeur: true } }, niveauEtude: true }
+      });
     });
+
     res.json(newClass);
   } catch (error) {
     console.error("Erreur création classe:", error);
     const msg = error.message?.includes('Niveau') || error.message?.includes('niveau')
       ? error.message
-      : 'Erreur interne.';
-    res.status(error.message?.includes('obligatoire') ? 400 : 500).json({ error: msg });
+      : (error.message || 'Erreur interne.');
+    res.status(error.message?.includes('obligatoire') || error.message?.includes('matière') ? 400 : 500).json({ error: msg });
   }
 });
 app.put('/api/admin/classes/:id', async (req, res) => {
   const id = parseInt(req.params.id);
-  const { nom, capacite, montant_annuel, anneeScolaireId, tranches, matieres } = req.body;
+  const { nom, capacite, montant_annuel, anneeScolaireId, tranches, matieresIds } = req.body;
   try {
     const niveauFields = await resolveClasseNiveauFields(req.body);
 
-    let matieresValides = null;
-    if (matieres !== undefined) {
-      const matieresCheck = validateClasseMatieres(matieres);
+    let catalogIds = null;
+    if (matieresIds !== undefined) {
+      const matieresCheck = validateClasseMatieresIds(matieresIds);
       if (matieresCheck.error) {
         return res.status(400).json({ error: matieresCheck.error });
       }
-      matieresValides = matieresCheck.matieres;
+      catalogIds = matieresCheck.catalogIds;
     }
 
     const updatedClass = await prisma.$transaction(async (tx) => {
@@ -1543,38 +2385,8 @@ app.put('/api/admin/classes/:id', async (req, res) => {
         await tx.trancheClasse.deleteMany({ where: { classeId: id } });
       }
 
-      if (matieresValides !== null) {
-        const existing = await tx.matiere.findMany({ where: { classeId: id } });
-        const incomingIds = matieresValides
-          .filter((m) => m.id)
-          .map((m) => parseInt(m.id, 10));
-
-        for (const ex of existing) {
-          if (!incomingIds.includes(ex.id)) {
-            const noteCount = await tx.note.count({ where: { matiereId: ex.id } });
-            if (noteCount > 0) {
-              throw new Error(`Impossible de supprimer « ${ex.nom} » : des notes existent déjà.`);
-            }
-            await tx.matiere.delete({ where: { id: ex.id } });
-          }
-        }
-
-        for (const m of matieresValides) {
-          const data = {
-            nom: m.nom,
-            coefficient: m.coefficient,
-            professeurId: m.professeurId,
-            classeId: id,
-          };
-          if (m.id) {
-            await tx.matiere.update({
-              where: { id: parseInt(m.id, 10) },
-              data,
-            });
-          } else {
-            await tx.matiere.create({ data });
-          }
-        }
+      if (catalogIds !== null) {
+        await syncClasseMatieresFromCatalog(tx, id, catalogIds);
       }
 
       return tx.classe.update({
@@ -1597,7 +2409,7 @@ app.put('/api/admin/classes/:id', async (req, res) => {
         },
         include: {
           tranches: true,
-          matieres: { include: { professeur: true }, orderBy: { nom: 'asc' } },
+          matieres: { include: { professeur: true, catalogMatiere: true }, orderBy: { nom: 'asc' } },
           niveauEtude: true,
         },
       });
@@ -1605,12 +2417,12 @@ app.put('/api/admin/classes/:id', async (req, res) => {
     res.json(updatedClass);
   } catch (error) {
     console.error("Erreur mise à jour classe:", error);
-    const msg = error.message?.includes('Impossible de supprimer')
+    const msg = error.message?.includes('Impossible de supprimer') || error.message?.includes('matière')
       ? error.message
       : error.message?.includes('Niveau') || error.message?.includes('niveau')
         ? error.message
         : 'Erreur interne.';
-    res.status(error.message?.includes('obligatoire') || error.message?.includes('introuvable') ? 400 : 500).json({ error: msg });
+    res.status(error.message?.includes('obligatoire') || error.message?.includes('introuvable') || error.message?.includes('notes') ? 400 : 500).json({ error: msg });
   }
 });
 
@@ -1627,20 +2439,41 @@ app.delete('/api/admin/classes/:id', async (req, res) => {
 
 app.get('/api/admin/stats', async (req, res) => {
   try {
-    const totalEleves = await prisma.eleve.count({
-      where: { statut: 'Actif' }
-    });
-    const totalProfesseurs = await prisma.professeur.count();
-    const totalClasses = await prisma.classe.count();
-    const inscriptionsAttente = await prisma.inscription.count({
-      where: { statut: 'En attente' }
-    });
+    const perimetre = getDirecteurPerimetre(req.authUser);
+
+    const totalEleves = perimetre
+      ? await prisma.eleve.count({
+          where: {
+            statut: 'Actif',
+            inscriptions: { some: { classe: { cycle: perimetre } } },
+          },
+        })
+      : await prisma.eleve.count({ where: { statut: 'Actif' } });
+
+    let totalProfesseurs;
+    if (perimetre) {
+      const profs = await prisma.professeur.findMany({ include: professeurMatieresInclude });
+      totalProfesseurs = filterProfesseursByDirecteurCycle(profs, perimetre).length;
+    } else {
+      totalProfesseurs = await prisma.professeur.count();
+    }
+
+    const totalClasses = perimetre
+      ? await prisma.classe.count({ where: { cycle: perimetre } })
+      : await prisma.classe.count();
+
+    const inscriptionsAttente = perimetre
+      ? await prisma.inscription.count({
+          where: { statut: 'En attente', classe: { cycle: perimetre } },
+        })
+      : await prisma.inscription.count({ where: { statut: 'En attente' } });
 
     res.json({
       eleves: totalEleves,
       professeurs: totalProfesseurs,
       classes: totalClasses,
-      inscriptionsEnAttente: inscriptionsAttente
+      inscriptionsEnAttente: inscriptionsAttente,
+      ...(perimetre ? { perimetre } : {}),
     });
   } catch (error) {
     console.error("Erreur admin stats:", error);
@@ -1650,7 +2483,9 @@ app.get('/api/admin/stats', async (req, res) => {
 
 app.get('/api/admin/chart-data', async (req, res) => {
   try {
+    const perimetre = getDirecteurPerimetre(req.authUser);
     const classes = await prisma.classe.findMany({
+      where: perimetre ? { cycle: perimetre } : undefined,
       include: {
         _count: {
           select: { inscriptions: true }
@@ -1665,12 +2500,15 @@ app.get('/api/admin/chart-data', async (req, res) => {
       }
     });
     
-    const studentsPerLevel = Object.keys(levelCounts).map(name => ({
-      name,
-      eleves: levelCounts[name]
-    }));
+    const studentsPerLevel = Object.keys(levelCounts)
+      .filter((name) => !perimetre || name === perimetre)
+      .map(name => ({
+        name,
+        eleves: levelCounts[name]
+      }));
 
     const inscriptionsList = await prisma.inscription.findMany({
+      where: buildInscriptionWhere(req.authUser, {}),
       select: { date_demande: true }
     });
 
@@ -1714,6 +2552,7 @@ app.get('/api/admin/chart-data', async (req, res) => {
 app.get('/api/admin/recent-registrations', async (req, res) => {
   try {
     const recent = await prisma.inscription.findMany({
+      where: buildInscriptionWhere(req.authUser, {}),
       take: 5,
       orderBy: { date_demande: 'desc' },
       include: { eleve: true, classe: true }
@@ -1739,13 +2578,39 @@ app.get('/api/admin/recent-registrations', async (req, res) => {
 //  MATIÈRES (Subjects) ROUTES
 // ═══════════════════════════════════════════════
 
-// Get all subjects
-app.get('/api/admin/matieres', async (req, res) => {
+// Catalogue des matières (sans classe — à sélectionner lors de la création d'une classe)
+app.get('/api/admin/matieres/catalog', async (req, res) => {
   try {
     const matieres = await prisma.matiere.findMany({
-      include: { professeur: true, classe: true },
-      orderBy: { nom: 'asc' }
+      where: { classeId: null, catalogMatiereId: null },
+      orderBy: { nom: 'asc' },
+      include: {
+        _count: { select: { instances: true } },
+      },
     });
+    res.json(matieres);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// Toutes les matières (catalogue + affectations par classe)
+app.get('/api/admin/matieres', async (req, res) => {
+  try {
+    const catalogOnly = req.query.catalog === 'true';
+    let matieres = await prisma.matiere.findMany({
+      where: catalogOnly ? { classeId: null, catalogMatiereId: null } : undefined,
+      include: {
+        professeur: true,
+        classe: true,
+        _count: catalogOnly ? { select: { instances: true } } : undefined,
+      },
+      orderBy: { nom: 'asc' },
+    });
+    const perimetre = getDirecteurPerimetre(req.authUser);
+    if (perimetre && !catalogOnly) {
+      matieres = filterMatieresByDirecteurCycle(matieres, perimetre);
+    }
     res.json(matieres);
   } catch (e) {
     res.status(500).json({ error: 'Erreur interne.' });
@@ -1756,6 +2621,7 @@ app.get('/api/admin/matieres', async (req, res) => {
 app.get('/api/admin/classes/:id/matieres', async (req, res) => {
   const classeId = parseInt(req.params.id);
   try {
+    if (!(await assertDirecteurClasseAccess(req, res, classeId))) return;
     const matieres = await prisma.matiere.findMany({
       where: { classeId },
       include: { professeur: true, classe: true },
@@ -1767,22 +2633,40 @@ app.get('/api/admin/classes/:id/matieres', async (req, res) => {
   }
 });
 
-// Create a subject for a specific class
+// Create a subject for a specific class (depuis le catalogue)
 app.post('/api/admin/classes/:id/matieres', async (req, res) => {
   const classeId = parseInt(req.params.id);
-  const check = validateMatierePayload({ ...req.body, classeId });
-  if (check.error) {
-    return res.status(400).json({ error: check.error });
+  const { catalogMatiereId } = req.body;
+
+  if (!catalogMatiereId) {
+    return res.status(400).json({ error: 'catalogMatiereId requis.' });
   }
 
   try {
+    if (!(await assertDirecteurClasseAccess(req, res, classeId))) return;
     const classe = await prisma.classe.findUnique({ where: { id: classeId } });
     if (!classe) return res.status(404).json({ error: 'Classe introuvable.' });
 
+    const catalog = await prisma.matiere.findFirst({
+      where: {
+        id: parseInt(catalogMatiereId, 10),
+        classeId: null,
+        catalogMatiereId: null,
+      },
+    });
+    if (!catalog) return res.status(404).json({ error: 'Matière catalogue introuvable.' });
+
+    const existing = await prisma.matiere.findFirst({
+      where: { classeId, catalogMatiereId: catalog.id },
+    });
+    if (existing) return res.json(existing);
+
     const m = await prisma.matiere.create({
       data: {
-        ...check.data,
+        nom: catalog.nom,
+        coefficient: catalog.coefficient,
         classeId,
+        catalogMatiereId: catalog.id,
       },
       include: { professeur: true, classe: true },
     });
@@ -1793,9 +2677,9 @@ app.post('/api/admin/classes/:id/matieres', async (req, res) => {
   }
 });
 
-// Create a subject (classe obligatoire)
+// Créer une matière au catalogue (sans classe)
 app.post('/api/admin/matieres', async (req, res) => {
-  const check = validateMatierePayload(req.body);
+  const check = validateMatierePayload(req.body, { catalogOnly: true });
   if (check.error) {
     return res.status(400).json({ error: check.error });
   }
@@ -1812,30 +2696,63 @@ app.post('/api/admin/matieres', async (req, res) => {
   }
 });
 
-// Update a subject
+// Modifier une matière du catalogue
 app.put('/api/admin/matieres/:id', async (req, res) => {
   const id = parseInt(req.params.id);
-  const check = validateMatierePayload(req.body);
-  if (check.error) {
-    return res.status(400).json({ error: check.error });
+  const { nom, coefficient } = req.body;
+
+  if (!nom?.trim()) {
+    return res.status(400).json({ error: 'Le nom de la matière est requis.' });
   }
 
   try {
-    const m = await prisma.matiere.update({
-      where: { id },
-      data: check.data,
-      include: { professeur: true, classe: true },
+    const existing = await prisma.matiere.findUnique({ where: { id } });
+    if (!existing) return res.status(404).json({ error: 'Matière introuvable.' });
+    if (existing.classeId) {
+      return res.status(400).json({ error: 'Modification réservée aux matières du catalogue.' });
+    }
+
+    const coeff = parseFloat(coefficient) || existing.coefficient;
+    const m = await prisma.$transaction(async (tx) => {
+      const updated = await tx.matiere.update({
+        where: { id },
+        data: { nom: nom.trim(), coefficient: coeff },
+        include: { _count: { select: { instances: true } } },
+      });
+
+      await tx.matiere.updateMany({
+        where: { catalogMatiereId: id },
+        data: { nom: nom.trim(), coefficient: coeff },
+      });
+
+      return updated;
     });
+
     res.json(m);
   } catch (e) {
     res.status(500).json({ error: 'Erreur interne.' });
   }
 });
 
-// Delete a subject
+// Supprimer une matière du catalogue
 app.delete('/api/admin/matieres/:id', async (req, res) => {
+  if (rejectDirecteurDelete(req, res)) return;
   const id = parseInt(req.params.id);
   try {
+    const existing = await prisma.matiere.findUnique({
+      where: { id },
+      include: { _count: { select: { instances: true } } },
+    });
+    if (!existing) return res.status(404).json({ error: 'Matière introuvable.' });
+    if (existing.classeId) {
+      return res.status(400).json({ error: 'Seules les matières du catalogue peuvent être supprimées ici.' });
+    }
+    if (existing._count.instances > 0) {
+      return res.status(409).json({
+        error: `Cette matière est utilisée dans ${existing._count.instances} classe(s). Retirez-la des classes d'abord.`,
+      });
+    }
+
     await prisma.matiere.delete({ where: { id } });
     res.json({ message: 'Matière supprimée' });
   } catch (e) {
@@ -1854,6 +2771,7 @@ app.get('/api/admin/classes/:classeId/matieres/:matiereId/notes', checkPaymentSt
   const { periode, annee_scolaire } = req.query;
 
   try {
+    if (!(await assertDirecteurClasseAccess(req, res, classeId))) return;
     // Get all validated students in this class
     const inscriptions = await prisma.inscription.findMany({
       where: {
@@ -1922,14 +2840,16 @@ app.get('/api/admin/notes/consultation', checkPaymentStatus, async (req, res) =>
   const { annee_scolaire, periode, classeId, niveau } = req.query;
 
   try {
+    if (classeId && !(await assertDirecteurClasseAccess(req, res, parseInt(classeId, 10)))) return;
+
     const inscriptions = await prisma.inscription.findMany({
-      where: {
+      where: buildInscriptionWhere(req.authUser, {
         statut: 'Validé',
         eleve: { statut: 'Actif' },
         ...(annee_scolaire ? { annee_scolaire } : {}),
         ...(classeId ? { classeId: parseInt(classeId) } : {}),
         ...(niveau ? { classe: { niveau } } : {}),
-      },
+      }),
       include: {
         eleve: {
           include: {
@@ -2007,6 +2927,7 @@ app.get('/api/admin/classes/:id/bulletins', checkPaymentStatus, async (req, res)
   const { periode } = req.query;
 
   try {
+    if (!(await assertDirecteurClasseAccess(req, res, classeId))) return;
     const classe = await prisma.classe.findUnique({
       where: { id: classeId },
       include: {
@@ -2085,10 +3006,10 @@ app.get('/api/admin/classes/:id/bulletins', checkPaymentStatus, async (req, res)
 
 // View Class Results (ADMIN ONLY)
 app.get('/api/admin/classes/:id/results', async (req, res) => {
-  // Check admin role here in real app
   const classeId = parseInt(req.params.id);
   
   try {
+    if (!(await assertDirecteurClasseAccess(req, res, classeId))) return;
     const classe = await prisma.classe.findUnique({
       where: { id: classeId },
       include: { niveauEtude: true },
@@ -2152,6 +3073,8 @@ app.post('/api/admin/professeurs', async (req, res) => {
     return res.status(400).json({ error: 'Nom, prénom et email sont requis.' });
   }
 
+  if (!(await assertDirecteurMatieresScope(req, res, matieresIds))) return;
+
   const normalizedEmail = email.trim().toLowerCase();
 
   try {
@@ -2189,10 +3112,7 @@ app.post('/api/admin/professeurs', async (req, res) => {
       });
 
       if (matieresIds && matieresIds.length > 0) {
-        await tx.matiere.updateMany({
-          where: { id: { in: matieresIds.map((id) => parseInt(id, 10)) } },
-          data: { professeurId: prof.id },
-        });
+        await syncProfesseurMatieresForUser(tx, prof.id, matieresIds, req.authUser);
       }
 
       return tx.professeur.findUnique({
@@ -2215,8 +3135,7 @@ app.post('/api/admin/professeurs', async (req, res) => {
       professeur: formatProfesseurForClient(professeur),
       utilisateur: professeur.utilisateur,
       motDePasseTemporaire: mot_de_passe ? undefined : tempPassword,
-      emailSent: emailResult.ok,
-      emailError: emailResult.ok ? undefined : emailResult.error,
+      ...emailResponseMeta(emailResult),
     });
   } catch (error) {
     console.error('Erreur création prof:', error);
@@ -2235,6 +3154,8 @@ app.put('/api/admin/professeurs/:id', async (req, res) => {
   if (!nom?.trim() || !prenom?.trim()) {
     return res.status(400).json({ error: 'Nom et prénom sont requis.' });
   }
+
+  if (!(await assertDirecteurMatieresScope(req, res, matieresIds))) return;
 
   try {
     const existing = await prisma.professeur.findUnique({ where: { id } });
@@ -2262,7 +3183,7 @@ app.put('/api/admin/professeurs/:id', async (req, res) => {
         },
       });
 
-      await syncProfesseurMatieres(tx, id, matieresIds);
+      await syncProfesseurMatieresForUser(tx, id, matieresIds, req.authUser);
 
       const updated = await tx.professeur.findUnique({
         where: { id },
@@ -2285,10 +3206,12 @@ app.put('/api/admin/professeurs/:id', async (req, res) => {
 app.put('/api/admin/professeurs/:id/affectations', async (req, res) => {
   const id = parseInt(req.params.id);
   const { matieresIds } = req.body;
+
+  if (!(await assertDirecteurMatieresScope(req, res, matieresIds))) return;
   
   try {
     await prisma.$transaction(async (tx) => {
-      await syncProfesseurMatieres(tx, id, matieresIds || []);
+      await syncProfesseurMatieresForUser(tx, id, matieresIds || [], req.authUser);
     });
     res.json({ message: 'Affectations mises à jour' });
   } catch (error) {
@@ -2298,6 +3221,7 @@ app.put('/api/admin/professeurs/:id/affectations', async (req, res) => {
 });
 
 app.delete('/api/admin/professeurs/:id', async (req, res) => {
+  if (rejectDirecteurDelete(req, res)) return;
   const id = parseInt(req.params.id);
 
   try {
@@ -2601,6 +3525,245 @@ app.get('/api/admin/remuneration-mensuelle', async (req, res) => {
     res.status(500).json({ error: 'Erreur interne.' });
   }
 });
+
+// --- STUDENT ROUTES (espace élève) ---
+
+async function requireStudent(req, res, next) {
+  const decoded = getUserFromToken(req);
+  if (!decoded || decoded.role !== 'ELEVE') {
+    return res.status(401).json({ error: 'Authentification élève requise.' });
+  }
+
+  const user = await prisma.utilisateur.findUnique({
+    where: { id: decoded.id },
+    select: {
+      id: true,
+      nom: true,
+      email: true,
+      role: true,
+      photoUrl: true,
+      eleveId: true,
+      eleve: {
+        select: {
+          id: true,
+          matricule: true,
+          nom: true,
+          prenom: true,
+          photoUrl: true,
+          statut: true,
+          statut_financier: true,
+          solde: true,
+          parent_nom: true,
+          parent_telephone: true,
+          parent_email: true,
+          infos_importantes: true,
+          exception_paiement_mensuel: true,
+        },
+      },
+    },
+  });
+
+  if (!user?.eleveId || !user.eleve) {
+    return res.status(403).json({ error: 'Profil élève introuvable pour ce compte.' });
+  }
+
+  req.studentUser = user;
+  req.eleve = user.eleve;
+  next();
+}
+
+app.get('/api/student/me', requireStudent, async (req, res) => {
+  const { eleve, ...user } = req.studentUser;
+  const activeAnnee = await getActiveAnneeNom(prisma);
+  const profile = await loadStudentProfile(prisma, eleve.id, activeAnnee);
+
+  res.json({
+    utilisateur: {
+      id: user.id,
+      nom: user.nom,
+      email: user.email,
+      role: user.role,
+      photoUrl: user.photoUrl || eleve.photoUrl || null,
+    },
+    eleve: {
+      ...eleve,
+      photoUrl: eleve.photoUrl || user.photoUrl || null,
+    },
+    inscription: profile?.inscription
+      ? {
+          statut: profile.inscription.statut,
+          annee_scolaire: profile.inscription.annee_scolaire,
+          classe: profile.classe ? { id: profile.classe.id, nom: profile.classe.nom } : null,
+        }
+      : null,
+  });
+});
+
+app.get('/api/student/annees', requireStudent, async (req, res) => {
+  try {
+    const options = await buildStudentFilterOptions(prisma, req.eleve.id);
+    res.json(options);
+  } catch (error) {
+    console.error('Erreur GET student/annees:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+app.get('/api/student/dashboard', requireStudent, async (req, res) => {
+  const annee_scolaire = req.query.annee_scolaire || (await getActiveAnneeNom(prisma));
+  const periode = req.query.periode || 'Trimestre 1';
+
+  try {
+    const profile = await loadStudentProfile(prisma, req.eleve.id, annee_scolaire);
+    const grades = await buildStudentGrades(prisma, req.eleve.id, { periode, annee_scolaire });
+    const paymentSummary = await buildStudentPaymentSummary(
+      prisma,
+      req.eleve.id,
+      annee_scolaire,
+      isStudentUpToDate
+    );
+
+    const unread = await prisma.notification.count({
+      where: { utilisateurId: req.studentUser.id, lu: false },
+    });
+
+    res.json({
+      annee_scolaire,
+      periode,
+      eleve: {
+        ...(grades.error ? {} : grades.eleve),
+        id: req.eleve.id,
+        matricule: req.eleve.matricule,
+        nom: req.eleve.nom,
+        prenom: req.eleve.prenom,
+        infos_importantes: req.eleve.infos_importantes,
+        statut_financier: paymentSummary?.statut_financier ?? req.eleve.statut_financier,
+      },
+      classe: profile?.classe
+        ? { id: profile.classe.id, nom: profile.classe.nom, niveau: profile.classe.niveau }
+        : paymentSummary?.classe
+          ? { id: paymentSummary.classe.id, nom: paymentSummary.classe.nom, niveau: paymentSummary.classe.niveau }
+          : null,
+      inscription: profile?.inscription
+        ? { statut: profile.inscription.statut, annee_scolaire: profile.inscription.annee_scolaire }
+        : paymentSummary?.inscription || null,
+      moyenneGenerale: grades.error ? null : grades.moyenneGenerale,
+      rang: grades.error ? null : grades.rang,
+      effectifClasse: grades.error ? null : grades.effectifClasse,
+      matieresNotees: grades.error
+        ? 0
+        : grades.matieres.filter((m) => m.moyenne !== null).length,
+      totalMatieres: grades.error ? 0 : grades.matieres.length,
+      finances: {
+        statut_financier: paymentSummary?.statut_financier ?? req.eleve.statut_financier,
+        solde: paymentSummary?.solde ?? req.eleve.solde,
+        annualAmount: paymentSummary?.annualAmount ?? 0,
+        totalPaid: paymentSummary?.totalPaid ?? 0,
+        remainingYear: paymentSummary?.remainingYear ?? 0,
+        paiementAJour: paymentSummary?.paiementAJour ?? false,
+      },
+      notificationsNonLues: unread,
+    });
+  } catch (error) {
+    console.error('Erreur GET student/dashboard:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+app.get('/api/student/notes', requireStudent, async (req, res) => {
+  const { periode, annee_scolaire } = req.query;
+  if (!annee_scolaire) {
+    return res.status(400).json({ error: 'annee_scolaire est requis.' });
+  }
+
+  try {
+    const data = await buildStudentGrades(prisma, req.eleve.id, {
+      periode: periode || 'Trimestre 1',
+      annee_scolaire,
+    });
+    if (data.error) return res.status(data.status || 400).json({ error: data.error });
+    res.json(data);
+  } catch (error) {
+    console.error('Erreur GET student/notes:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+app.get('/api/student/bulletin', requireStudent, async (req, res) => {
+  const { periode, annee_scolaire } = req.query;
+  if (!periode || !annee_scolaire) {
+    return res.status(400).json({ error: 'periode et annee_scolaire sont requis.' });
+  }
+
+  try {
+    const data = await buildStudentBulletin(prisma, req.eleve.id, { periode, annee_scolaire });
+    if (data.error) return res.status(data.status || 400).json({ error: data.error });
+    res.json(data);
+  } catch (error) {
+    console.error('Erreur GET student/bulletin:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+app.get('/api/student/paiements', requireStudent, async (req, res) => {
+  const annee_scolaire = req.query.annee_scolaire || (await getActiveAnneeNom(prisma));
+
+  try {
+    const summary = await buildStudentPaymentSummary(
+      prisma,
+      req.eleve.id,
+      annee_scolaire,
+      isStudentUpToDate
+    );
+
+    if (!summary) {
+      return res.status(404).json({ error: 'Profil élève introuvable.' });
+    }
+
+    res.json(summary);
+  } catch (error) {
+    console.error('Erreur GET student/paiements:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+app.get('/api/student/paiements/:id/recu', requireStudent, async (req, res) => {
+  const paiementId = parseInt(req.params.id, 10);
+  if (Number.isNaN(paiementId)) {
+    return res.status(400).json({ error: 'Identifiant invalide.' });
+  }
+  try {
+    const paiement = await prisma.paiement.findFirst({
+      where: { id: paiementId, eleveId: req.eleve.id },
+      select: { id: true },
+    });
+    if (!paiement) {
+      return res.status(404).json({ error: 'Paiement introuvable.' });
+    }
+    const recu = await buildPaymentReceiptContext(prisma, paiementId, isStudentUpToDate);
+    if (!recu) {
+      return res.status(404).json({ error: 'Paiement introuvable.' });
+    }
+    res.json(recu);
+  } catch (error) {
+    console.error('Erreur GET student/paiements/:id/recu:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+// --- PARENT ROUTES (espace parent — lecture seule sur les enfants liés) ---
+
+app.use('/api/parent', createParentRouter({
+  prisma,
+  getUserFromToken,
+  getActiveAnneeNom,
+  loadStudentProfile,
+  buildStudentFilterOptions,
+  buildStudentGrades,
+  buildStudentBulletin,
+  buildStudentPaymentSummary,
+  isStudentUpToDate,
+}));
 
 // --- TEACHER ROUTES (données strictement limitées au professeur connecté) ---
 
@@ -3107,6 +4270,8 @@ app.post('/api/teacher/notes/bulk', requireTeacher, async (req, res) => {
 // Calculate Resultats (Global Average)
 app.post('/api/admin/resultats/calculer', async (req, res) => {
   const { classeId, annee_scolaire, periode } = req.body;
+
+  if (!(await assertDirecteurClasseAccess(req, res, parseInt(classeId, 10)))) return;
   
   try {
     const classe = await prisma.classe.findUnique({
@@ -3180,7 +4345,7 @@ app.get('/api/admin/taux-reussite', async (req, res) => {
 
     const result = [];
 
-    for (const niveau of CYCLES) {
+    for (const niveau of cyclesForAuthUser(req.authUser)) {
       const inscriptions = await prisma.inscription.findMany({
         where: {
           statut: 'Validé',
@@ -3279,25 +4444,7 @@ function formatPaymentReference(paiement) {
 }
 
 async function getPaymentWithDetails(paiementId) {
-  const paiement = await prisma.paiement.findUnique({
-    where: { id: paiementId },
-    include: paymentEleveInclude,
-  });
-  if (!paiement) return null;
-
-  const matchingInscriptions = paiement.eleve.inscriptions.filter(
-    (i) => i.annee_scolaire === paiement.annee_scolaire
-  );
-
-  return {
-    ...paiement,
-    eleve: {
-      ...paiement.eleve,
-      inscriptions: matchingInscriptions.length
-        ? matchingInscriptions
-        : paiement.eleve.inscriptions.slice(0, 1),
-    },
-  };
+  return buildPaymentReceiptContext(prisma, paiementId, isStudentUpToDate);
 }
 
 // CREATE a new Paiement
@@ -3364,6 +4511,10 @@ app.post('/api/paiements', async (req, res) => {
     });
 
     const fullPaiement = await getPaymentWithDetails(paiement.id);
+    await createPaymentNotifications(prisma, {
+      paiement: fullPaiement,
+      eleve: fullPaiement.eleve,
+    }).catch((err) => console.error('Notif paiement:', err));
     res.json({ message: 'Paiement enregistré avec succès', paiement: fullPaiement });
   } catch (error) {
     console.error('Erreur création paiement:', error);
@@ -3579,6 +4730,28 @@ app.delete('/api/paiements/:id', async (req, res) => {
 });
 
 // UPDATE Eleve financial status (manual adjustment) — admin uniquement
+app.put('/api/admin/eleves/:id/financier', requireAdmin, async (req, res) => {
+  const eleveId = parseInt(req.params.id);
+  const { solde, statut_financier } = req.body;
+  try {
+    const data = {};
+    if (solde !== undefined && solde !== null && solde !== '') {
+      data.solde = parseFloat(solde);
+    }
+    if (statut_financier) {
+      data.statut_financier = statut_financier;
+    }
+    const eleve = await prisma.eleve.update({
+      where: { id: eleveId },
+      data,
+    });
+    res.json({ message: 'Statut financier mis à jour avec succès', eleve });
+  } catch (error) {
+    console.error('Erreur mise à jour statut financier:', error);
+    res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
 app.put('/api/eleves/:id/financier', requireAdmin, async (req, res) => {
   const eleveId = parseInt(req.params.id);
   const { solde, statut_financier } = req.body;
